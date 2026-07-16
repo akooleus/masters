@@ -280,48 +280,6 @@ static bool divide_by_first_order(const std::vector<real_t>& h,
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  check_divisibility_biquad
-//
-//  Быстрая проверка делимости БЕЗ формирования частного.
-//  Выполняет ту же рекурсию, но сохраняет только два
-//  последних значения.  Полезна для отладки.
-// ═══════════════════════════════════════════════════════════════
-
-static bool check_divisibility_biquad(const std::vector<real_t>& h,
-                                      real_t gamma)
-{
-    const size_t len = h.size();
-    if (len < 3) return false;
-
-    if (len == 3) {
-        const real_t q0 = h[0];
-        const real_t rem1 = std::abs(h[2] - q0);
-        const real_t rem2 = std::abs(h[1] + gamma * q0);
-        return (rem1 < REMAINDER_TOL) && (rem2 < REMAINDER_TOL);
-    }
-
-    const size_t qlen = len - 2;
-
-    real_t q_prev2 = h[0];                         // q[0]
-    real_t q_prev1 = h[1] + gamma * q_prev2;       // q[1]
-
-    real_t q_cur = q_prev1;
-    for (size_t n = 2; n < qlen; ++n) {
-        q_cur   = h[n] + gamma * q_prev1 - q_prev2;
-        q_prev2 = q_prev1;
-        q_prev1 = q_cur;
-    }
-
-    // q_prev1 = q[qlen-1], q_prev2 = q[qlen-2]
-    real_t rem1 = std::abs(q_prev1 - h[0]);
-    real_t rem2 = (qlen >= 2)
-                ? std::abs(h[1] + gamma * h[0] - q_prev2)
-                : 0.0;
-
-    return (rem1 < REMAINDER_TOL) && (rem2 < REMAINDER_TOL);
-}
-
-// ═══════════════════════════════════════════════════════════════
 //  interleave_indices
 //
 //  Формирует чередующийся порядок индексов нулей полосы
@@ -358,27 +316,6 @@ interleave_indices(const std::vector<unsigned>& stopband_k)
     }
 
     return result;
-}
-
-// ═══════════════════════════════════════════════════════════════
-//  enforce_quotient_symmetry
-//
-//  Принудительная симметризация частного.
-//
-//  При использовании HALF_RECURRENCE эта функция не нужна
-//  (симметрия уже обеспечена конструктивно).
-//  Оставлена для FULL_RECURRENCE режима, где усреднение
-//  первой и второй половины уменьшает ошибку.
-// ═══════════════════════════════════════════════════════════════
-
-static void enforce_quotient_symmetry(std::vector<real_t>& q)
-{
-    const size_t len = q.size();
-    for (size_t n = 0; n < len / 2; ++n) {
-        real_t avg = (q[n] + q[len - 1 - n]) * 0.5;
-        q[n]           = avg;
-        q[len - 1 - n] = avg;
-    }
 }
 
 // ═══════════════════════════════════════════════════════════════

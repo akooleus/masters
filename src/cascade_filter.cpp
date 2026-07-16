@@ -19,8 +19,8 @@
 //  DirectFilterState).
 //
 //  Обычный путь использует double/long double. Для декомпозиций с
-//  явно указанным runtime_decimal_digits=50 создаётся отдельное
-//  Boost.Multiprecision-состояние; выбор точности не скрывается от API.
+//  явно указанным runtime_decimal_digits создаётся отдельное состояние
+//  binary128 либо Boost.Multiprecision; выбор точности не скрывается от API.
 //
 //  Собственная реализация настоящей работы.
 // ═══════════════════════════════════════════════════════════════
@@ -51,9 +51,16 @@ static real_t stage_scale_quartic(real_t alpha, real_t beta)
     return std::max<real_t>(1.0, l1);
 }
 
-using runtime_mp = boost::multiprecision::number<
+#if defined(__SIZEOF_FLOAT128__)
+using runtime_mp34 = __float128;
+#else
+using runtime_mp34 = boost::multiprecision::number<
+    boost::multiprecision::cpp_bin_float<34>>;
+#endif
+using runtime_mp50 = boost::multiprecision::number<
     boost::multiprecision::cpp_bin_float<50>>;
 
+template <class RuntimeReal>
 class MultiprecisionCascadeState final : public CascadeExtendedState {
 public:
     explicit MultiprecisionCascadeState(const CascadeDecomposition& dec)
@@ -66,7 +73,7 @@ public:
             }
             const size_t order = dec.blocks[i].coefficients.empty()
                 ? 0 : dec.blocks[i].coefficients.size() - 1;
-            blocks_[i].delay.assign(order, runtime_mp(0));
+            blocks_[i].delay.assign(order, RuntimeReal(0));
         }
 
         for (double coefficient : dec.remainder) {
@@ -74,7 +81,7 @@ public:
         }
         const size_t remainder_order = dec.remainder.empty()
             ? 0 : dec.remainder.size() - 1;
-        remainder_delay_.assign(remainder_order, runtime_mp(0));
+        remainder_delay_.assign(remainder_order, RuntimeReal(0));
 
         for (const CascadeSectionPlacement& placement : execution_order_) {
             if (placement.kind != CascadeSectionKind::Block
@@ -82,34 +89,59 @@ public:
                 throw std::invalid_argument(
                     "multiprecision runtime requires a block-only execution order");
             }
+            for (RuntimeReal& coefficient
+                 : blocks_[placement.index].coefficients) {
+                coefficient *= RuntimeReal(placement.scale);
+            }
         }
     }
 
     double push(double x) override
     {
-        runtime_mp value(x);
+        RuntimeReal value(x);
         update_peak(value);
         for (const CascadeSectionPlacement& placement : execution_order_) {
             Block& block = blocks_[placement.index];
-            runtime_mp output = block.coefficients.empty()
-                ? value : block.coefficients[0] * value;
-            for (size_t i = 1; i < block.coefficients.size(); ++i) {
-                output += block.coefficients[i] * block.delay[i - 1];
-            }
-            for (size_t i = block.delay.size(); i-- > 1;) {
-                block.delay[i] = block.delay[i - 1];
-            }
-            if (!block.delay.empty()) {
+            RuntimeReal output;
+            if (block.coefficients.size() == 9 && block.delay.size() == 8) {
+                output = block.coefficients[0] * value
+                       + block.coefficients[1] * block.delay[0]
+                       + block.coefficients[2] * block.delay[1]
+                       + block.coefficients[3] * block.delay[2]
+                       + block.coefficients[4] * block.delay[3]
+                       + block.coefficients[5] * block.delay[4]
+                       + block.coefficients[6] * block.delay[5]
+                       + block.coefficients[7] * block.delay[6]
+                       + block.coefficients[8] * block.delay[7];
+                block.delay[7] = block.delay[6];
+                block.delay[6] = block.delay[5];
+                block.delay[5] = block.delay[4];
+                block.delay[4] = block.delay[3];
+                block.delay[3] = block.delay[2];
+                block.delay[2] = block.delay[1];
+                block.delay[1] = block.delay[0];
                 block.delay[0] = value;
+            } else {
+                output = block.coefficients.empty()
+                    ? value : block.coefficients[0] * value;
+                for (size_t i = 1; i < block.coefficients.size(); ++i) {
+                    output += block.coefficients[i] * block.delay[i - 1];
+                }
+                for (size_t i = block.delay.size(); i-- > 1;) {
+                    block.delay[i] = block.delay[i - 1];
+                }
+                if (!block.delay.empty()) {
+                    block.delay[0] = value;
+                }
             }
-            value = output * runtime_mp(placement.scale);
+            value = output;
             update_peak(value);
         }
 
         if (remainder_coefficients_.size() == 1) {
             value *= remainder_coefficients_[0];
         } else if (!remainder_coefficients_.empty()) {
-            runtime_mp output = remainder_coefficients_[0] * value;
+            RuntimeReal output = remainder_coefficients_[0] * value;
             for (size_t i = 1; i < remainder_coefficients_.size(); ++i) {
                 output += remainder_coefficients_[i] * remainder_delay_[i - 1];
             }
@@ -130,10 +162,10 @@ public:
     void reset() override
     {
         for (Block& block : blocks_) {
-            std::fill(block.delay.begin(), block.delay.end(), runtime_mp(0));
+            std::fill(block.delay.begin(), block.delay.end(), RuntimeReal(0));
         }
         std::fill(
-            remainder_delay_.begin(), remainder_delay_.end(), runtime_mp(0));
+            remainder_delay_.begin(), remainder_delay_.end(), RuntimeReal(0));
         peak_ = 0.0L;
     }
 
@@ -144,22 +176,22 @@ public:
 
 private:
     struct Block {
-        std::vector<runtime_mp> coefficients;
-        std::vector<runtime_mp> delay;
+        std::vector<RuntimeReal> coefficients;
+        std::vector<RuntimeReal> delay;
     };
 
-    void update_peak(const runtime_mp& value)
+    void update_peak(const RuntimeReal& value)
     {
         const long double magnitude =
-            static_cast<long double>(abs(value));
+            std::abs(static_cast<long double>(value));
         peak_ = std::max(peak_, magnitude);
     }
 
     std::vector<Block> blocks_;
     std::vector<CascadeSectionPlacement> execution_order_;
-    std::vector<runtime_mp> remainder_coefficients_;
-    std::vector<runtime_mp> remainder_delay_;
-    runtime_mp gain_;
+    std::vector<RuntimeReal> remainder_coefficients_;
+    std::vector<RuntimeReal> remainder_delay_;
+    RuntimeReal gain_;
     long double peak_ = 0.0L;
 };
 
@@ -243,12 +275,16 @@ void CascadeFilterState::init(const CascadeDecomposition& dec)
     qt_states.clear();
     block_states.clear();
     if (dec.diagnostics.runtime_decimal_digits != 0) {
-        if (dec.diagnostics.runtime_decimal_digits != 50) {
+        if (dec.diagnostics.runtime_decimal_digits == 34) {
+            extended_state =
+                std::make_unique<MultiprecisionCascadeState<runtime_mp34>>(dec);
+        } else if (dec.diagnostics.runtime_decimal_digits == 50) {
+            extended_state =
+                std::make_unique<MultiprecisionCascadeState<runtime_mp50>>(dec);
+        } else {
             throw std::invalid_argument(
                 "unsupported cascade runtime precision");
         }
-        extended_state =
-            std::make_unique<MultiprecisionCascadeState>(dec);
         gain = 1.0;
         return;
     }

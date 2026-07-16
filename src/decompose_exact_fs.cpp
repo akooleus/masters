@@ -801,9 +801,11 @@ CascadeDecomposition recombine_into_blocks(
         result.blocks.push_back(std::move(block));
     }
 
-    // Distribute the mathematical gain across all blocks in the logarithmic
-    // domain. Every scaled block receives the same L1 norm, so no single
-    // section has to carry a huge compensation factor.
+    // Start with the mathematical gain distributed evenly across the blocks.
+    // choose_stable_blocking() subsequently moves a controlled fraction of
+    // that compensation to the final gain and selects the distribution that
+    // minimises the measured time-domain peak while still passing the impulse
+    // reconstruction criterion.
     std::vector<CascadeSectionPlacement> placements;
     std::vector<double> log_l1(result.blocks.size(), 0.0);
     double log_l1_sum = 0.0;
@@ -875,6 +877,127 @@ CascadeDecomposition recombine_into_blocks(
     return result;
 }
 
+void distribute_block_gain(CascadeDecomposition& dec, double fraction)
+{
+    if (dec.blocks.empty()) {
+        return;
+    }
+
+    std::vector<double> log_l1(dec.blocks.size(), 0.0);
+    double log_l1_sum = 0.0;
+    for (size_t i = 0; i < dec.blocks.size(); ++i) {
+        double l1 = 0.0;
+        for (double coefficient : dec.blocks[i].coefficients) {
+            l1 += std::abs(coefficient);
+        }
+        l1 = std::max(l1, 1e-300);
+        log_l1[i] = std::log(l1);
+        log_l1_sum += log_l1[i];
+    }
+
+    const double abs_gain = std::max(1e-300, std::abs(dec.gain));
+    const double total_compensation_log = std::log(abs_gain) + log_l1_sum;
+    static constexpr double MAX_RUNTIME_GAIN_LOG = 600.0;
+    const double runtime_gain_log = std::clamp(
+        fraction * total_compensation_log,
+        -MAX_RUNTIME_GAIN_LOG,
+        MAX_RUNTIME_GAIN_LOG);
+    const double common_log_l1 =
+        (total_compensation_log - runtime_gain_log)
+        / static_cast<double>(dec.blocks.size());
+
+    for (CascadeSectionPlacement& placement : dec.execution_order) {
+        if (placement.kind == CascadeSectionKind::Block) {
+            placement.scale = std::exp(
+                common_log_l1 - log_l1[placement.index]);
+        }
+    }
+    dec.runtime_gain = std::copysign(
+        std::exp(runtime_gain_log), dec.gain);
+}
+
+void build_transient_balanced_block_order(CascadeDecomposition& dec,
+                                          const DirectFIR& fir)
+{
+    if (dec.blocks.empty()) {
+        return;
+    }
+
+    std::vector<CascadeSectionPlacement> placements(dec.blocks.size());
+    for (const CascadeSectionPlacement& placement : dec.execution_order) {
+        if (placement.kind == CascadeSectionKind::Block
+            && placement.index < placements.size()) {
+            placements[placement.index] = placement;
+        }
+    }
+
+    long double final_l1 = 0.0L;
+    long double final_peak = 0.0L;
+    for (double coefficient : fir.h) {
+        const long double magnitude = std::abs(
+            static_cast<long double>(coefficient));
+        final_l1 += magnitude;
+        final_peak = std::max(final_peak, magnitude);
+    }
+    final_l1 = std::max(final_l1, 1e-300L);
+    final_peak = std::max(final_peak, 1e-300L);
+
+    std::vector<bool> used(dec.blocks.size(), false);
+    std::vector<long double> partial = {1.0L};
+    dec.execution_order.clear();
+    dec.execution_order.reserve(dec.blocks.size());
+
+    for (size_t position = 0; position < dec.blocks.size(); ++position) {
+        const long double progress = static_cast<long double>(position + 1)
+                                   / dec.blocks.size();
+        const long double target_log_l1 = progress * std::log(final_l1);
+        const long double target_log_peak = progress * std::log(final_peak);
+        size_t best = dec.blocks.size();
+        long double best_score =
+            std::numeric_limits<long double>::infinity();
+        std::vector<long double> best_product;
+
+        for (size_t i = 0; i < dec.blocks.size(); ++i) {
+            if (used[i]) {
+                continue;
+            }
+            const CascadeBlock& block = dec.blocks[i];
+            std::vector<long double> trial(
+                partial.size() + block.coefficients.size() - 1, 0.0L);
+            for (size_t a = 0; a < partial.size(); ++a) {
+                for (size_t b = 0; b < block.coefficients.size(); ++b) {
+                    trial[a + b] += partial[a]
+                        * static_cast<long double>(block.coefficients[b])
+                        * static_cast<long double>(placements[i].scale);
+                }
+            }
+
+            long double l1 = 0.0L;
+            long double peak = 0.0L;
+            for (long double coefficient : trial) {
+                const long double magnitude = std::abs(coefficient);
+                l1 += magnitude;
+                peak = std::max(peak, magnitude);
+            }
+            const long double l1_delta =
+                std::log(std::max(l1, 1e-300L)) - target_log_l1;
+            const long double peak_delta =
+                std::log(std::max(peak, 1e-300L)) - target_log_peak;
+            const long double score = l1_delta * l1_delta
+                                    + peak_delta * peak_delta;
+            if (score < best_score) {
+                best_score = score;
+                best = i;
+                best_product = std::move(trial);
+            }
+        }
+
+        used[best] = true;
+        dec.execution_order.push_back(placements[best]);
+        partial = std::move(best_product);
+    }
+}
+
 double cascade_impulse_error(const CascadeDecomposition& dec,
                              const DirectFIR& fir,
                              long double* peak_internal = nullptr)
@@ -910,6 +1033,15 @@ unsigned maximum_block_order(const CascadeDecomposition& dec)
                 result,
                 static_cast<unsigned>(block.coefficients.size() - 1));
         }
+    }
+    return result;
+}
+
+size_t block_runtime_work(const CascadeDecomposition& dec)
+{
+    size_t result = dec.blocks.size(); // one scale multiply per block
+    for (const CascadeBlock& block : dec.blocks) {
+        result += block.coefficients.size();
     }
     return result;
 }
@@ -997,77 +1129,149 @@ CascadeDecomposition choose_stable_blocking(
     bool has_high_precision_candidate = false;
     double best_error = std::numeric_limits<double>::infinity();
     unsigned best_order = 0;
+    static constexpr unsigned GAIN_DISTRIBUTION_STEPS = 16;
     for (unsigned order : block_orders) {
-        CascadeDecomposition candidate = recombine_into_blocks(
+        CascadeDecomposition frequency_base = recombine_into_blocks(
             sections, fir, ordered_precise_factors, order);
-        long double peak_internal = 0.0L;
-        const double error = cascade_impulse_error(
-            candidate, fir, &peak_internal);
-        candidate.diagnostics.runtime_peak_internal =
-            static_cast<double>(peak_internal);
-        candidate.diagnostics.runtime_impulse_error = error;
-        candidate.diagnostics.runtime_verified =
-            std::isfinite(error) && error <= tolerance;
-        candidate.diagnostics.selected_max_block_order =
-            maximum_block_order(candidate);
+        CascadeDecomposition transient_base = frequency_base;
+        build_transient_balanced_block_order(transient_base, fir);
+        const std::array<CascadeDecomposition, 2> bases = {
+            std::move(frequency_base), std::move(transient_base)
+        };
+        CascadeDecomposition order_best;
+        CascadeDecomposition native_accepted;
+        double order_best_error = std::numeric_limits<double>::infinity();
+        long double accepted_peak = std::numeric_limits<long double>::infinity();
+        bool has_native_accepted = false;
+
+        for (const CascadeDecomposition& base : bases) {
+            for (unsigned step = 0;
+                 step <= GAIN_DISTRIBUTION_STEPS; ++step) {
+                CascadeDecomposition candidate = base;
+                const double fraction = static_cast<double>(step)
+                                      / GAIN_DISTRIBUTION_STEPS;
+                distribute_block_gain(candidate, fraction);
+                long double peak_internal = 0.0L;
+                const double error = cascade_impulse_error(
+                    candidate, fir, &peak_internal);
+                candidate.diagnostics.runtime_peak_internal =
+                    static_cast<double>(peak_internal);
+                candidate.diagnostics.runtime_impulse_error = error;
+                candidate.diagnostics.runtime_verified =
+                    std::isfinite(error) && error <= tolerance;
+                candidate.diagnostics.selected_max_block_order =
+                    maximum_block_order(candidate);
+
+                if (error < order_best_error) {
+                    order_best = candidate;
+                    order_best_error = error;
+                }
+                if (candidate.diagnostics.runtime_verified
+                    && peak_internal < accepted_peak) {
+                    native_accepted = std::move(candidate);
+                    accepted_peak = peak_internal;
+                    has_native_accepted = true;
+                }
+            }
+        }
 
         // Prefer a native-precision short cascade whenever one exists. If
         // only a full-order native block is viable, keep the first genuinely
         // short factorization whose rounded coefficients are accurate and
-        // whose 50-decimal-digit runtime passes the same impulse criterion.
-        if (!has_high_precision_candidate
-            && error > tolerance
-            && order <= 32
+        // whose lowest available extended-precision runtime passes the same
+        // impulse criterion.
+        if (!has_native_accepted
+            && order <= 16
             && order < fir.order()) {
             const double coefficient_error =
-                block_coefficient_error_mp(candidate, fir);
+                block_coefficient_error_mp(bases.front(), fir);
             if (std::isfinite(coefficient_error)
                 && coefficient_error <= tolerance) {
-                candidate.diagnostics.runtime_decimal_digits = 50;
-                candidate.diagnostics.status =
-                    CascadeBuildStatus::HighPrecisionShortBlockCascade;
-                long double mp_peak = 0.0L;
-                const double mp_error = cascade_impulse_error(
-                    candidate, fir, &mp_peak);
-                if (std::isfinite(mp_error) && mp_error <= tolerance) {
-                    candidate.diagnostics.runtime_verified = true;
-                    candidate.diagnostics.runtime_impulse_error = mp_error;
-                    candidate.diagnostics.runtime_peak_internal =
-                        static_cast<double>(mp_peak);
-                    high_precision_best = candidate;
-                    has_high_precision_candidate = true;
-                } else {
-                    candidate.diagnostics.runtime_decimal_digits = 0;
-                    candidate.diagnostics.status =
-                        CascadeBuildStatus::Unspecified;
+                static constexpr unsigned precision_candidates[] = {34, 50};
+                for (unsigned digits : precision_candidates) {
+                    long double best_mp_peak =
+                        std::numeric_limits<long double>::infinity();
+                    CascadeDecomposition precision_best;
+                    bool precision_passed = false;
+                    for (const CascadeDecomposition& base : bases) {
+                        for (unsigned step = 0;
+                             step <= GAIN_DISTRIBUTION_STEPS; ++step) {
+                            CascadeDecomposition candidate = base;
+                            const double fraction = static_cast<double>(step)
+                                                  / GAIN_DISTRIBUTION_STEPS;
+                            distribute_block_gain(candidate, fraction);
+                            candidate.diagnostics.runtime_decimal_digits = digits;
+                            candidate.diagnostics.status =
+                                CascadeBuildStatus::HighPrecisionShortBlockCascade;
+                            long double mp_peak = 0.0L;
+                            const double mp_error = cascade_impulse_error(
+                                candidate, fir, &mp_peak);
+                            if (std::isfinite(mp_error)
+                                && mp_error <= tolerance
+                                && mp_peak < best_mp_peak) {
+                                candidate.diagnostics.runtime_verified = true;
+                                candidate.diagnostics.runtime_impulse_error = mp_error;
+                                candidate.diagnostics.runtime_peak_internal =
+                                    static_cast<double>(mp_peak);
+                                candidate.diagnostics.selected_max_block_order =
+                                    maximum_block_order(candidate);
+                                precision_best = std::move(candidate);
+                                best_mp_peak = mp_peak;
+                                precision_passed = true;
+                            }
+                        }
+                    }
+                    if (precision_passed) {
+                        const bool prefer_candidate =
+                            !has_high_precision_candidate
+                            || precision_best.diagnostics.runtime_decimal_digits
+                                < high_precision_best.diagnostics.runtime_decimal_digits
+                            || (precision_best.diagnostics.runtime_decimal_digits
+                                    == high_precision_best.diagnostics.runtime_decimal_digits
+                                && block_runtime_work(precision_best)
+                                    < block_runtime_work(high_precision_best));
+                        if (prefer_candidate) {
+                            high_precision_best = std::move(precision_best);
+                            has_high_precision_candidate = true;
+                        }
+                        break;
+                    }
                 }
             }
         }
-        if (error < best_error) {
-            best = std::move(candidate);
-            best_error = error;
+
+        if (order_best_error < best_error) {
+            best = std::move(order_best);
+            best_error = order_best_error;
             best_order = order;
         }
-        if (error <= tolerance) {
-            CascadeDecomposition accepted = std::move(best);
-            if (accepted.diagnostics.selected_max_block_order >= fir.order()
+        if (has_native_accepted) {
+            if (native_accepted.diagnostics.selected_max_block_order
+                    >= fir.order()
                 && has_high_precision_candidate) {
                 std::cerr << "decompose_exact_fs_full: selected high-precision "
                           << "short-block cascade (order <= "
                           << high_precision_best.diagnostics.selected_max_block_order
-                          << ", impulse max error " << std::scientific
+                          << ", "
+                          << high_precision_best.diagnostics.runtime_decimal_digits
+                          << " decimal digits, impulse max error "
+                          << std::scientific
                           << high_precision_best.diagnostics.runtime_impulse_error
                           << ")" << std::defaultfloat << "\n";
                 return high_precision_best;
             }
-            accepted.diagnostics.status =
-                (accepted.diagnostics.selected_max_block_order < fir.order())
+            native_accepted.diagnostics.status =
+                (native_accepted.diagnostics.selected_max_block_order
+                    < fir.order())
                 ? CascadeBuildStatus::ShortBlockCascade
                 : CascadeBuildStatus::FullOrderFactorBlock;
             std::cerr << "decompose_exact_fs_full: selected block order <= "
                       << order << " (impulse max error " << std::scientific
-                      << error << ")" << std::defaultfloat << "\n";
-            return accepted;
+                      << native_accepted.diagnostics.runtime_impulse_error
+                      << ", internal peak "
+                      << native_accepted.diagnostics.runtime_peak_internal
+                      << ")" << std::defaultfloat << "\n";
+            return native_accepted;
         }
     }
 

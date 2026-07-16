@@ -18,7 +18,7 @@ int main()
     };
 
     // Native precision is preferred through N257T. N513T verifies the
-    // explicitly reported 50-decimal-digit short-block backend.
+    // explicitly reported 34-decimal-digit short-block backend.
     const std::vector<Case> cases = {
         {"N32T",  {32,  48000.0, 8000.0, 12000.0}, true,  4,  1e-11, 1e-10, false},
         {"N33",   {33,  32000.0, 4000.0,  6000.0}, false, 4,  1e-11, 1e-10, false},
@@ -46,7 +46,7 @@ int main()
         ok &= expect(full.diagnostics.status == expected_status,
                      prefix + "expected a verified short-block cascade");
         ok &= expect(full.diagnostics.runtime_decimal_digits
-                         == (tc.high_precision_runtime ? 50u : 0u),
+                         == (tc.high_precision_runtime ? 34u : 0u),
                      prefix + "runtime precision selection mismatch");
         ok &= expect(full.diagnostics.complement_verified,
                      prefix + "complementary identity was not verified");
@@ -100,6 +100,16 @@ int main()
                 filter_cascade(full, short_impulse));
             ok &= expect(float_impulse.max_abs_err <= 1e-6,
                          prefix + "float API did not use the verified backend");
+
+            CascadeDecomposition fallback_precision = full;
+            fallback_precision.diagnostics.runtime_decimal_digits = 50;
+            const std::vector<double> probe(32u, 0.25);
+            const std::vector<double> fallback_output =
+                filter_cascade_double(fallback_precision, probe);
+            ok &= expect(std::all_of(
+                             fallback_output.begin(), fallback_output.end(),
+                             [](double value) { return std::isfinite(value); }),
+                         prefix + "50-digit fallback backend is not finite");
         }
     }
 

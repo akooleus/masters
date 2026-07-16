@@ -80,6 +80,12 @@ if(CASCADE_BUILD_EXACT_FS)
         src/decompose_exact_fs.cpp
     )
     link_extended_backend(exact_fs_diagnostics)
+
+    add_cascade_executable(cascade_benchmark
+        examples/cascade_benchmark.cpp
+        src/decompose_exact_fs.cpp
+    )
+    link_extended_backend(cascade_benchmark)
 endif()
 
 if(BUILD_TESTING)
