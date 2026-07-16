@@ -19,8 +19,8 @@
 //  DirectFilterState).
 //
 //  Обычный путь использует double/long double. Для декомпозиций с
-//  явно указанным runtime_decimal_digits создаётся отдельное состояние
-//  binary128 либо Boost.Multiprecision; выбор точности не скрывается от API.
+//  явно указанным runtime_precision создаётся отдельное состояние binary128
+//  либо Boost.Multiprecision; поля диагностики backend не выбирают.
 //
 //  Собственная реализация настоящей работы.
 // ═══════════════════════════════════════════════════════════════
@@ -59,6 +59,119 @@ using runtime_mp34 = boost::multiprecision::number<
 #endif
 using runtime_mp50 = boost::multiprecision::number<
     boost::multiprecision::cpp_bin_float<50>>;
+
+void validate_runtime_decomposition(const CascadeDecomposition& dec)
+{
+    if (!std::isfinite(dec.gain) || !std::isfinite(dec.runtime_gain)) {
+        throw std::invalid_argument("cascade gain is not finite");
+    }
+    if (dec.remainder.empty()) {
+        throw std::invalid_argument("cascade remainder is empty");
+    }
+    for (double coefficient : dec.remainder) {
+        if (!std::isfinite(coefficient)) {
+            throw std::invalid_argument(
+                "cascade remainder coefficient is not finite");
+        }
+    }
+    for (const FirstOrder& section : dec.first_order) {
+        if (section.sign != -1 && section.sign != 1) {
+            throw std::invalid_argument("invalid first-order section sign");
+        }
+    }
+    for (const Biquad& section : dec.biquads) {
+        if (!std::isfinite(section.gamma)) {
+            throw std::invalid_argument("biquad coefficient is not finite");
+        }
+    }
+    for (const Quartic& section : dec.quartics) {
+        if (!std::isfinite(section.alpha) || !std::isfinite(section.beta)) {
+            throw std::invalid_argument("quartic coefficient is not finite");
+        }
+    }
+    for (const CascadeBlock& block : dec.blocks) {
+        if (block.coefficients.empty()) {
+            throw std::invalid_argument("cascade block is empty");
+        }
+        for (double coefficient : block.coefficients) {
+            if (!std::isfinite(coefficient)) {
+                throw std::invalid_argument(
+                    "cascade block coefficient is not finite");
+            }
+        }
+    }
+
+    const size_t section_count = dec.first_order.size() + dec.biquads.size()
+                               + dec.quartics.size() + dec.blocks.size();
+    if (dec.execution_order.empty()) {
+        if (!dec.blocks.empty()) {
+            throw std::invalid_argument(
+                "block cascade has no explicit execution order");
+        }
+    } else {
+        if (dec.execution_order.size() != section_count) {
+            throw std::invalid_argument(
+                "execution order does not cover every cascade section");
+        }
+        std::vector<bool> seen_first(dec.first_order.size(), false);
+        std::vector<bool> seen_biquad(dec.biquads.size(), false);
+        std::vector<bool> seen_quartic(dec.quartics.size(), false);
+        std::vector<bool> seen_block(dec.blocks.size(), false);
+        for (const CascadeSectionPlacement& placement : dec.execution_order) {
+            if (!std::isfinite(placement.scale) || placement.scale <= 0.0) {
+                throw std::invalid_argument(
+                    "cascade execution scale is invalid");
+            }
+            std::vector<bool>* seen = nullptr;
+            switch (placement.kind) {
+            case CascadeSectionKind::FirstOrder:
+                seen = &seen_first;
+                break;
+            case CascadeSectionKind::Biquad:
+                seen = &seen_biquad;
+                break;
+            case CascadeSectionKind::Quartic:
+                seen = &seen_quartic;
+                break;
+            case CascadeSectionKind::Block:
+                seen = &seen_block;
+                break;
+            default:
+                throw std::invalid_argument("invalid cascade section kind");
+            }
+            if (placement.index >= seen->size()) {
+                throw std::invalid_argument(
+                    "cascade execution index is out of range");
+            }
+            if ((*seen)[placement.index]) {
+                throw std::invalid_argument(
+                    "cascade execution order contains a duplicate section");
+            }
+            (*seen)[placement.index] = true;
+        }
+    }
+
+    switch (dec.runtime_precision) {
+    case CascadeRuntimePrecision::Native:
+        break;
+    case CascadeRuntimePrecision::Extended34:
+    case CascadeRuntimePrecision::Extended50:
+        if (!dec.first_order.empty() || !dec.biquads.empty()
+            || !dec.quartics.empty() || dec.execution_order.empty()) {
+            throw std::invalid_argument(
+                "extended runtime requires an explicit block-only cascade");
+        }
+        for (const CascadeSectionPlacement& placement : dec.execution_order) {
+            if (placement.kind != CascadeSectionKind::Block) {
+                throw std::invalid_argument(
+                    "extended runtime requires a block-only execution order");
+            }
+        }
+        break;
+    default:
+        throw std::invalid_argument("unsupported cascade runtime precision");
+    }
+}
 
 template <class RuntimeReal>
 class MultiprecisionCascadeState final : public CascadeExtendedState {
@@ -208,21 +321,31 @@ private:
 
 void DoubleFilterState::init(const std::vector<real_t>& coeffs)
 {
+    initialized = false;
+    if (coeffs.empty()) {
+        throw std::invalid_argument("double FIR coefficients are empty");
+    }
     h   = coeffs;
     buf.assign(coeffs.size(), 0.0);
     idx = 0;
+    initialized = true;
 }
 
 void DoubleFilterState::reset()
 {
+    if (!initialized) {
+        throw std::logic_error("double FIR state is not initialized");
+    }
     std::fill(buf.begin(), buf.end(), 0.0);
     idx = 0;
 }
 
 double DoubleFilterState::push(double x)
 {
+    if (!initialized) {
+        throw std::logic_error("double FIR state is not initialized");
+    }
     const unsigned N = static_cast<unsigned>(h.size());
-    if (N == 0) return 0.0;
 
     // Записать новый отсчёт
     buf[idx] = x;
@@ -263,6 +386,8 @@ double DoubleFilterState::push(double x)
 
 void CascadeFilterState::init(const CascadeDecomposition& dec)
 {
+    initialized = false;
+    validate_runtime_decomposition(dec);
     // Межсекционное масштабирование уменьшает рост промежуточных
     // амплитуд в длинных каскадах. Для каждого звена используем
     // безопасную верхнюю оценку его усиления через L1-норму
@@ -274,11 +399,11 @@ void CascadeFilterState::init(const CascadeDecomposition& dec)
     bq_states.clear();
     qt_states.clear();
     block_states.clear();
-    if (dec.diagnostics.runtime_decimal_digits != 0) {
-        if (dec.diagnostics.runtime_decimal_digits == 34) {
+    if (dec.runtime_precision != CascadeRuntimePrecision::Native) {
+        if (dec.runtime_precision == CascadeRuntimePrecision::Extended34) {
             extended_state =
                 std::make_unique<MultiprecisionCascadeState<runtime_mp34>>(dec);
-        } else if (dec.diagnostics.runtime_decimal_digits == 50) {
+        } else if (dec.runtime_precision == CascadeRuntimePrecision::Extended50) {
             extended_state =
                 std::make_unique<MultiprecisionCascadeState<runtime_mp50>>(dec);
         } else {
@@ -286,6 +411,7 @@ void CascadeFilterState::init(const CascadeDecomposition& dec)
                 "unsupported cascade runtime precision");
         }
         gain = 1.0;
+        initialized = true;
         return;
     }
     const bool has_explicit_order = !execution_order.empty();
@@ -352,6 +478,7 @@ void CascadeFilterState::init(const CascadeDecomposition& dec)
     gain = has_explicit_order
         ? dec.runtime_gain
         : static_cast<real_t>(gain_acc);
+    initialized = true;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -360,6 +487,9 @@ void CascadeFilterState::init(const CascadeDecomposition& dec)
 
 void CascadeFilterState::reset()
 {
+    if (!initialized) {
+        throw std::logic_error("cascade FIR state is not initialized");
+    }
     peak_internal = 0.0L;
     if (extended_state) {
         extended_state->reset();
@@ -410,6 +540,9 @@ void CascadeFilterState::reset()
 
 double CascadeFilterState::push_double(double x)
 {
+    if (!initialized) {
+        throw std::logic_error("cascade FIR state is not initialized");
+    }
     if (extended_state) {
         const double output = extended_state->push(x);
         peak_internal = extended_state->peak();

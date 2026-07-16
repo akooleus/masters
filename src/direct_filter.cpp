@@ -22,15 +22,22 @@
 
 #include "cascade_fir.h"
 
+#include <stdexcept>
+
 // ═══════════════════════════════════════════════════════════════
 //  DirectFilterState — инициализация
 // ═══════════════════════════════════════════════════════════════
 
 void DirectFilterState::init(const std::vector<real_t>& coeffs)
 {
+    initialized = false;
+    if (coeffs.empty()) {
+        throw std::invalid_argument("direct FIR coefficients are empty");
+    }
     h   = coeffs;
     buf.assign(coeffs.size(), 0.0f);
     idx = 0;
+    initialized = true;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -39,6 +46,9 @@ void DirectFilterState::init(const std::vector<real_t>& coeffs)
 
 void DirectFilterState::reset()
 {
+    if (!initialized) {
+        throw std::logic_error("direct FIR state is not initialized");
+    }
     std::fill(buf.begin(), buf.end(), 0.0f);
     idx = 0;
 }
@@ -58,6 +68,9 @@ void DirectFilterState::reset()
 
 sample_t DirectFilterState::push(sample_t x)
 {
+    if (!initialized) {
+        throw std::logic_error("direct FIR state is not initialized");
+    }
     const unsigned N = static_cast<unsigned>(h.size());
 
     // Записать новый отсчёт в кольцевой буфер

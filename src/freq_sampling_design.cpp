@@ -431,24 +431,10 @@ void recompute_remainder(CascadeDecomposition& dec,
     }
 
     // ── Шаг 2: разделить оригинальный h[n] на cascade_product ─
-    auto [quotient, math_remainder] = poly_divide(h_original, cascade_product);
+    auto division = poly_divide(h_original, cascade_product);
+    std::vector<real_t> quotient = std::move(division.first);
 
-    // ── Шаг 3: проверить математический остаток ─────────────
-    //  Он должен быть ≈ 0 (все нули C(z) — нули h(z)).
-    double max_math_rem = 0.0;
-    for (const auto& v : math_remainder) {
-        double av = std::abs(v);
-        if (av > max_math_rem) max_math_rem = av;
-    }
-
-    if (max_math_rem > 1e-6) {
-        std::cerr << "  recompute_remainder: мат. остаток = "
-                  << std::scientific << max_math_rem
-                  << " (ожидалось ≈ 0). Возможно, не все нули "
-                     "принадлежат h(z).\n" << std::defaultfloat;
-    }
-
-    // ── Шаг 4: принудить симметрию нового остатка ────────────
+    // ── Шаг 3: принудить симметрию нового остатка ────────────
     //  Частное = h / C тоже симметрично (палиндром / палиндром).
     for (size_t n = 0; n < quotient.size() / 2; ++n) {
         real_t avg = (quotient[n] + quotient[quotient.size() - 1 - n]) * 0.5;
@@ -456,6 +442,6 @@ void recompute_remainder(CascadeDecomposition& dec,
         quotient[quotient.size() - 1 - n] = avg;
     }
 
-    // ── Шаг 5: заменить остаток в декомпозиции ──────────────
+    // ── Шаг 4: заменить остаток в декомпозиции ──────────────
     dec.remainder = std::move(quotient);
 }

@@ -1201,6 +1201,9 @@ CascadeDecomposition choose_stable_blocking(
                                                   / GAIN_DISTRIBUTION_STEPS;
                             distribute_block_gain(candidate, fraction);
                             candidate.diagnostics.runtime_decimal_digits = digits;
+                            candidate.runtime_precision = (digits == 34u)
+                                ? CascadeRuntimePrecision::Extended34
+                                : CascadeRuntimePrecision::Extended50;
                             candidate.diagnostics.status =
                                 CascadeBuildStatus::HighPrecisionShortBlockCascade;
                             long double mp_peak = 0.0L;
@@ -1249,15 +1252,6 @@ CascadeDecomposition choose_stable_blocking(
             if (native_accepted.diagnostics.selected_max_block_order
                     >= fir.order()
                 && has_high_precision_candidate) {
-                std::cerr << "decompose_exact_fs_full: selected high-precision "
-                          << "short-block cascade (order <= "
-                          << high_precision_best.diagnostics.selected_max_block_order
-                          << ", "
-                          << high_precision_best.diagnostics.runtime_decimal_digits
-                          << " decimal digits, impulse max error "
-                          << std::scientific
-                          << high_precision_best.diagnostics.runtime_impulse_error
-                          << ")" << std::defaultfloat << "\n";
                 return high_precision_best;
             }
             native_accepted.diagnostics.status =
@@ -1265,19 +1259,10 @@ CascadeDecomposition choose_stable_blocking(
                     < fir.order())
                 ? CascadeBuildStatus::ShortBlockCascade
                 : CascadeBuildStatus::FullOrderFactorBlock;
-            std::cerr << "decompose_exact_fs_full: selected block order <= "
-                      << order << " (impulse max error " << std::scientific
-                      << native_accepted.diagnostics.runtime_impulse_error
-                      << ", internal peak "
-                      << native_accepted.diagnostics.runtime_peak_internal
-                      << ")" << std::defaultfloat << "\n";
             return native_accepted;
         }
     }
 
-    std::cerr << "decompose_exact_fs_full: no block size met tolerance; "
-              << "using best order " << best_order << " with impulse max error "
-              << std::scientific << best_error << std::defaultfloat << "\n";
     CascadeDiagnostics diagnostics = sections.diagnostics;
     diagnostics.runtime_impulse_error = best_error;
     diagnostics.selected_max_block_order = best_order;
@@ -1292,8 +1277,6 @@ CascadeDecomposition factor_reduced_residual(const DirectFIR& fir,
 {
     CascadeDecomposition stage1 = reduction.decomposition;
     if (!stage1.diagnostics.complement_verified) {
-        std::cerr << "decompose_exact_fs_full: complementary identity failed; "
-                     "using direct-form fallback\n";
         return direct_form_fallback(fir, stage1.diagnostics);
     }
     const int residual_degree = static_cast<int>(reduction.residual.size()) - 1;
@@ -1316,8 +1299,6 @@ CascadeDecomposition factor_reduced_residual(const DirectFIR& fir,
         return stage1;
     }
     if ((residual_degree % 2) != 0) {
-        std::cerr << "decompose_exact_fs_full: odd residual degree "
-                  << residual_degree << "; using direct-form fallback\n";
         return direct_form_fallback(fir, stage1.diagnostics);
     }
 
@@ -1333,20 +1314,8 @@ CascadeDecomposition factor_reduced_residual(const DirectFIR& fir,
     stage1.diagnostics.root_backward_error =
         static_cast<double>(roots.max_backward_error);
     if (!roots.converged || roots.roots.size() != M) {
-        std::cerr << "decompose_exact_fs_full: multiprecision root solve failed"
-                  << " (degree=" << M
-                  << ", iterations=" << roots.iterations
-                  << ", backward=" << std::scientific
-                  << static_cast<double>(roots.max_backward_error)
-                  << std::defaultfloat << "); using direct-form fallback\n";
         return direct_form_fallback(fir, stage1.diagnostics);
     }
-
-    std::cerr << "decompose_exact_fs_full: residual u-degree=" << M
-              << ", Aberth iterations=" << roots.iterations
-              << ", backward=" << std::scientific
-              << static_cast<double>(roots.max_backward_error)
-              << std::defaultfloat << "\n";
 
     std::vector<bool> used(M, false);
     std::vector<std::vector<mp_real>> residual_factors;
@@ -1399,11 +1368,6 @@ CascadeDecomposition factor_reduced_residual(const DirectFIR& fir,
 
         if (best == M
             || best_distance > pair_tolerance * (1 + abs(roots.roots[i]))) {
-            std::cerr << "decompose_exact_fs_full: unmatched complex u-root"
-                      << " (nearest relative distance=" << std::scientific
-                      << static_cast<double>(best_distance / (1 + abs(roots.roots[i])))
-                      << std::defaultfloat << "); "
-                         "using direct-form fallback\n";
             return direct_form_fallback(fir, stage1.diagnostics);
         }
 
@@ -1440,16 +1404,11 @@ CascadeDecomposition factor_reduced_residual(const DirectFIR& fir,
             mp_real("1e-90"), max_abs(reduction.residual));
     }
 
-    std::cerr << "decompose_exact_fs_full: root-set rebuild="
-              << std::scientific << static_cast<double>(root_rebuild_error)
-              << std::defaultfloat << "\n";
     stage1.diagnostics.root_rebuild_error =
         static_cast<double>(root_rebuild_error);
     stage1.diagnostics.roots_verified =
         root_rebuild_error <= mp_real("1e-45");
     if (root_rebuild_error > mp_real("1e-45")) {
-        std::cerr << "decompose_exact_fs_full: root set does not reconstruct "
-                     "the reduced polynomial; using direct-form fallback\n";
         return direct_form_fallback(fir, stage1.diagnostics);
     }
 
@@ -1481,13 +1440,6 @@ CascadeDecomposition factor_reduced_residual(const DirectFIR& fir,
         }
     }
 
-    std::cerr << "decompose_exact_fs_full: sections fo="
-              << stage1.first_order.size()
-              << ", bq=" << stage1.biquads.size()
-              << ", qt=" << stage1.quartics.size()
-              << ", gain=" << std::scientific << stage1.gain
-              << ", runtime_gain=" << stage1.runtime_gain
-              << std::defaultfloat << "\n";
     return choose_stable_blocking(stage1, fir, ordered_precise_factors);
 }
 

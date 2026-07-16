@@ -48,6 +48,11 @@ int main()
         ok &= expect(full.diagnostics.runtime_decimal_digits
                          == (tc.high_precision_runtime ? 34u : 0u),
                      prefix + "runtime precision selection mismatch");
+        ok &= expect(full.runtime_precision
+                         == (tc.high_precision_runtime
+                             ? CascadeRuntimePrecision::Extended34
+                             : CascadeRuntimePrecision::Native),
+                     prefix + "runtime backend selection mismatch");
         ok &= expect(full.diagnostics.complement_verified,
                      prefix + "complementary identity was not verified");
         ok &= expect(full.diagnostics.roots_verified,
@@ -102,7 +107,8 @@ int main()
                          prefix + "float API did not use the verified backend");
 
             CascadeDecomposition fallback_precision = full;
-            fallback_precision.diagnostics.runtime_decimal_digits = 50;
+            fallback_precision.runtime_precision =
+                CascadeRuntimePrecision::Extended50;
             const std::vector<double> probe(32u, 0.25);
             const std::vector<double> fallback_output =
                 filter_cascade_double(fallback_precision, probe);

@@ -553,9 +553,6 @@ CascadeDecomposition decompose(const DirectFIR& fir,
         if (divide_by_first_order(current, -1, q)) {
             dec.first_order.push_back(FirstOrder{-1});
             current = std::move(q);
-        } else {
-            std::cerr << "  Предупреждение: нуль z=+1 (k=0) не подтверждён "
-                         "делением; пропущен.\n";
         }
     }
 
@@ -564,9 +561,6 @@ CascadeDecomposition decompose(const DirectFIR& fir,
         if (divide_by_first_order(current, +1, q)) {
             dec.first_order.push_back(FirstOrder{+1});
             current = std::move(q);
-        } else {
-            std::cerr << "  Предупреждение: нуль z=−1 (k=N/2) не подтверждён "
-                         "делением; пропущен.\n";
         }
     }
 
@@ -601,20 +595,13 @@ CascadeDecomposition decompose(const DirectFIR& fir,
         real_t initial_rem1 = 0.0, initial_rem2 = 0.0;
         compute_division_residual(current, gamma, initial_rem1, initial_rem2);
 
-        real_t total_corr = 0.0;
-        real_t final_rem1 = initial_rem1;
-        int    corr_iters = 0;
-
         if (initial_rem1 > CORR_TARGET) {
             for (int iter = 0; iter < MAX_CORR_ITER; ++iter) {
-                real_t c = correct_for_divisibility(current, gamma);
-                total_corr += c;
-                ++corr_iters;
+                correct_for_divisibility(current, gamma);
 
                 // Проверить, достигнут ли порог
                 real_t rem1 = 0.0, rem2 = 0.0;
                 compute_division_residual(current, gamma, rem1, rem2);
-                final_rem1 = rem1;
 
                 if (rem1 < CORR_TARGET) break;
 
@@ -622,16 +609,6 @@ CascadeDecomposition decompose(const DirectFIR& fir,
                 // (вырожденный случай, коррекция не работает)
                 if (iter > 2 && rem1 > initial_rem1 * 0.5) break;
             }
-        }
-
-        if (initial_rem1 > 1e-10) {
-            std::cerr << "  Коррекция k=" << k
-                      << " γ=" << std::setprecision(6) << gamma
-                      << ": невязка " << std::scientific
-                      << initial_rem1 << " → " << final_rem1
-                      << "  (" << corr_iters << " итер."
-                      << ", ΣΔh=" << total_corr << ")"
-                      << std::defaultfloat << "\n";
         }
 
         // ── Деление (половинная рекурсия) ───────────────────
@@ -688,15 +665,6 @@ CascadeDecomposition decompose(const DirectFIR& fir,
                                ? max_err / max_h : max_err;
 
                 if (rel_err > DIVISION_QUALITY_THRESHOLD) {
-                    std::cerr << "  Адаптивный лимит: k=" << k
-                              << " γ=" << std::setprecision(6) << gamma
-                              << " rel_err(vs orig)=" << std::scientific
-                              << rel_err
-                              << " > " << DIVISION_QUALITY_THRESHOLD
-                              << ". Прекращаю деления ("
-                              << dec.biquads.size()
-                              << " звеньев выделено).\n"
-                              << std::defaultfloat;
                     // НЕ добавляем biquad, НЕ обновляем current.
                     // Все невыделенные нули остаются в остатке.
                     break;
@@ -705,10 +673,6 @@ CascadeDecomposition decompose(const DirectFIR& fir,
 
             dec.biquads.push_back(Biquad{gamma, k});
             current = std::move(q);
-        } else {
-            // При HALF_RECURRENCE сюда попадаем только если len < 4
-            std::cerr << "  Предупреждение: полином слишком короткий для "
-                         "деления на D(z) с k=" << k << ". Пропущено.\n";
         }
     }
 
@@ -764,20 +728,8 @@ CascadeDecomposition decompose(const DirectFIR& fir,
 
     if (err_recomp < err_iter) {
         dec.remainder = std::move(recomputed_remainder);
-        if (err_iter > 1e-10) {
-            std::cerr << "  Остаток: пересчитанный лучше итеративного"
-                      << " (" << std::scientific << err_recomp
-                      << " vs " << err_iter << ")"
-                      << std::defaultfloat << "\n";
-        }
     } else {
         dec.remainder = std::move(iterative_remainder);
-        if (err_recomp > 1e-10 && err_iter > 1e-10) {
-            std::cerr << "  Остаток: итеративный лучше пересчитанного"
-                      << " (" << std::scientific << err_iter
-                      << " vs " << err_recomp << ")"
-                      << std::defaultfloat << "\n";
-        }
     }
 
     return dec;

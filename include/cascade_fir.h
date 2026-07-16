@@ -60,7 +60,9 @@ struct DirectFIR {
     // нуля по уже округлённым коэффициентам h[n].
     std::vector<real_t> frequency_samples;
 
-    unsigned order()  const { return static_cast<unsigned>(h.size()) - 1; }
+    unsigned order()  const {
+        return h.empty() ? 0u : static_cast<unsigned>(h.size() - 1u);
+    }
     unsigned length() const { return static_cast<unsigned>(h.size()); }
 };
 
@@ -136,6 +138,14 @@ enum class CascadeBuildStatus {
     Failed
 };
 
+// Арифметика, которую должен использовать runtime. Это часть исполняемого
+// представления каскада, а не диагностическое поле.
+enum class CascadeRuntimePrecision {
+    Native = 0,
+    Extended34 = 34,
+    Extended50 = 50
+};
+
 // Численные свидетельства, по которым вызывающий код может отличить
 // короткий каскад от безопасного отката к прямой форме.
 struct CascadeDiagnostics {
@@ -178,6 +188,8 @@ struct CascadeDecomposition {
     // учитывает эти масштабы и не обязан совпадать с gain.
     std::vector<CascadeSectionPlacement> execution_order;
     real_t runtime_gain = 1.0;
+    CascadeRuntimePrecision runtime_precision =
+        CascadeRuntimePrecision::Native;
     CascadeDiagnostics diagnostics;
 
     // Общее число выделенных нулей
@@ -194,6 +206,34 @@ struct CascadeDecomposition {
     }
 };
 
+// Версионированный артефакт готового каскада. Отпечаток связывает его с
+// конкретными h[n], частотными выборками и спецификацией исходного фильтра.
+// Сам формат файла реализован без внешних библиотек.
+static constexpr std::uint32_t CASCADE_ARTIFACT_FORMAT_VERSION = 1u;
+
+struct CascadeArtifactMetadata {
+    std::uint32_t format_version = CASCADE_ARTIFACT_FORMAT_VERSION;
+    FilterSpec source_spec{0u, 0.0, 0.0, 0.0};
+    std::uint32_t source_coefficient_count = 0u;
+    std::uint64_t source_fingerprint = 0u;
+};
+
+struct CascadeArtifact {
+    CascadeArtifactMetadata metadata;
+    CascadeDecomposition decomposition;
+};
+
+std::uint64_t cascade_source_fingerprint(const DirectFIR& fir);
+CascadeArtifact make_cascade_artifact(
+    const DirectFIR& fir,
+    const CascadeDecomposition& decomposition);
+bool cascade_artifact_matches(const CascadeArtifact& artifact,
+                              const DirectFIR& fir);
+void validate_cascade_artifact(const CascadeArtifact& artifact);
+void save_cascade_artifact(const std::string& path,
+                           const CascadeArtifact& artifact);
+CascadeArtifact load_cascade_artifact(const std::string& path);
+
 // ═══════════════════════════════════════════════════════════════
 //  Состояние прямого КИХ-фильтра (для пооотсчётной фильтрации)
 // ═══════════════════════════════════════════════════════════════
@@ -201,7 +241,8 @@ struct CascadeDecomposition {
 struct DirectFilterState {
     std::vector<real_t> h;         // коэффициенты
     std::vector<sample_t> buf;     // кольцевой буфер входных отсчётов
-    unsigned idx;                  // текущая позиция в буфере
+    unsigned idx = 0;              // текущая позиция в буфере
+    bool initialized = false;
 
     void init(const std::vector<real_t>& coeffs);
     sample_t push(sample_t x);     // подать отсчёт, вернуть выход
@@ -220,7 +261,8 @@ struct DirectFilterState {
 struct DoubleFilterState {
     std::vector<real_t> h;         // коэффициенты (double)
     std::vector<double> buf;       // кольцевой буфер (double!)
-    unsigned idx;
+    unsigned idx = 0;
+    bool initialized = false;
 
     void init(const std::vector<real_t>& coeffs);
     double push(double x);         // вход/выход в double
@@ -271,9 +313,10 @@ struct CascadeFilterState {
     std::vector<BlockState>      block_states;
     std::vector<CascadeSectionPlacement> execution_order;
     DoubleFilterState            rem_state;    // фильтр-остаток (double!)
-    real_t                       gain;
-    long double                 peak_internal;
+    real_t                       gain = 1.0;
+    long double                 peak_internal = 0.0L;
     std::unique_ptr<CascadeExtendedState> extended_state;
+    bool initialized = false;
 
     CascadeFilterState() = default;
     CascadeFilterState(const CascadeFilterState&) = delete;

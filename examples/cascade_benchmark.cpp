@@ -5,7 +5,9 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <limits>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -199,11 +201,18 @@ int main(int argc, char** argv)
                      requested.c_str());
         return 2;
     }
+    if (argc > 5) {
+        std::fprintf(stderr,
+                     "usage: %s [N257T|N513T] [samples] [repeats] [artifact]\n",
+                     argv[0]);
+        return 2;
+    }
 
     const size_t cascade_samples = (argc > 2)
         ? parse_size(argv[2], "sample count") : selected->cascade_samples;
     const unsigned repeats = static_cast<unsigned>(
         (argc > 3) ? parse_size(argv[3], "repeat count") : 5u);
+    const std::string artifact_path = (argc > 4) ? argv[4] : "";
     const size_t direct_samples = std::max<size_t>(262144u, cascade_samples);
     const size_t warmup = 4096u;
     const size_t input_size = warmup + std::max(direct_samples, cascade_samples);
@@ -215,10 +224,68 @@ int main(int argc, char** argv)
     const double design_ms = std::chrono::duration<double, std::milli>(
         Clock::now() - design_start).count();
 
-    const auto decompose_start = Clock::now();
-    const CascadeDecomposition dec = decompose_exact_fs_full(fir, true);
-    const double decompose_ms = std::chrono::duration<double, std::milli>(
-        Clock::now() - decompose_start).count();
+    CascadeDecomposition dec;
+    double decompose_ms = 0.0;
+    double artifact_save_ms = 0.0;
+    double artifact_load_ms = 0.0;
+    std::size_t artifact_bytes = 0u;
+    const char* artifact_mode = "disabled";
+    try {
+        bool artifact_exists = false;
+        if (!artifact_path.empty()) {
+            std::ifstream probe(artifact_path, std::ios::binary);
+            artifact_exists = probe.good();
+        }
+
+        if (artifact_exists) {
+            const auto load_start = Clock::now();
+            CascadeArtifact artifact = load_cascade_artifact(artifact_path);
+            artifact_load_ms = std::chrono::duration<double, std::milli>(
+                Clock::now() - load_start).count();
+            if (!cascade_artifact_matches(artifact, fir)) {
+                throw std::runtime_error(
+                    "artifact does not match the requested source FIR");
+            }
+            dec = std::move(artifact.decomposition);
+            artifact_mode = "loaded";
+        } else {
+            const auto decompose_start = Clock::now();
+            dec = decompose_exact_fs_full(fir, true);
+            decompose_ms = std::chrono::duration<double, std::milli>(
+                Clock::now() - decompose_start).count();
+            if (!artifact_path.empty()) {
+                const CascadeArtifact artifact =
+                    make_cascade_artifact(fir, dec);
+                const auto save_start = Clock::now();
+                save_cascade_artifact(artifact_path, artifact);
+                artifact_save_ms = std::chrono::duration<double, std::milli>(
+                    Clock::now() - save_start).count();
+
+                const auto load_start = Clock::now();
+                CascadeArtifact loaded = load_cascade_artifact(artifact_path);
+                artifact_load_ms = std::chrono::duration<double, std::milli>(
+                    Clock::now() - load_start).count();
+                if (!cascade_artifact_matches(loaded, fir)) {
+                    throw std::runtime_error(
+                        "new artifact does not match the source FIR");
+                }
+                dec = std::move(loaded.decomposition);
+                artifact_mode = "built";
+            }
+        }
+
+        if (!artifact_path.empty()) {
+            std::ifstream size_probe(
+                artifact_path, std::ios::binary | std::ios::ate);
+            const std::streamoff size = size_probe.tellg();
+            if (size >= 0) {
+                artifact_bytes = static_cast<std::size_t>(size);
+            }
+        }
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "artifact error: %s\n", error.what());
+        return 2;
+    }
 
     const auto direct_init_start = Clock::now();
     DoubleFilterState direct_init_probe;
@@ -251,6 +318,9 @@ int main(int argc, char** argv)
                 dec.diagnostics.runtime_decimal_digits);
     std::printf("design_ms=%.3f decompose_ms=%.3f direct_init_us=%.3f cascade_init_us=%.3f\n",
                 design_ms, decompose_ms, direct_init_us, cascade_init_us);
+    std::printf("artifact_mode=%s artifact_bytes=%zu save_ms=%.3f load_ms=%.3f\n",
+                artifact_mode, artifact_bytes,
+                artifact_save_ms, artifact_load_ms);
     std::printf("direct_samples=%zu direct_ns_per_sample=%.3f direct_Msample_s=%.6f\n",
                 direct_samples, direct.median_ns_per_sample, direct_msamples);
     std::printf("cascade_samples=%zu cascade_ns_per_sample=%.3f cascade_Msample_s=%.6f realtime_x=%.3f\n",

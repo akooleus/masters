@@ -25,6 +25,7 @@ target_include_directories(cascade_core INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/in
 
 set(CASCADE_COMMON_SOURCES
     src/freq_sampling_design.cpp
+    src/cascade_artifact.cpp
     src/cascade_decompose.cpp
     src/cascade_filter.cpp
     src/direct_filter.cpp
@@ -104,6 +105,10 @@ if(BUILD_TESTING)
 
     add_core_test(signal_generation_test
         tests/core/signal_generation_test.cpp
+    )
+
+    add_core_test(cascade_artifact_test
+        tests/core/cascade_artifact_test.cpp
     )
 
     # ── Exact-first tests ────────────────────────────────────
