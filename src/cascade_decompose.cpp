@@ -878,6 +878,11 @@ std::vector<real_t> recompose(const CascadeDecomposition& dec,
         result = poly_multiply(result, factor);
     }
 
+    // Адаптивно объединённые низкопорядковые подфильтры.
+    for (const auto& block : dec.blocks) {
+        result = poly_multiply(result, block.coefficients);
+    }
+
     // Применяем коэффициент усиления
     if (std::abs(dec.gain - 1.0) > 1e-15) {
         for (auto& v : result) {

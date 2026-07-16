@@ -10,9 +10,12 @@
 #include <numeric>
 #include <algorithm>
 #include <cassert>
+#include <array>
 #include <iostream>
 #include <iomanip>
 #include <chrono>
+#include <limits>
+#include <memory>
 
 // ═══════════════════════════════════════════════════════════════
 //  Базовые типы
@@ -48,8 +51,14 @@ struct FilterSpec {
 // ═══════════════════════════════════════════════════════════════
 
 struct DirectFIR {
-    std::vector<real_t> h;     // коэффициенты h[0..N-1]
+    std::vector<real_t> h;                  // коэффициенты h[0..N-1]
     FilterSpec          spec;
+
+    // Исходные вещественные амплитудные выборки метода частотной
+    // выборки. Это источник истины для аналитически известных нулей:
+    // нулевая выборка задаёт корень точно, без обратного распознавания
+    // нуля по уже округлённым коэффициентам h[n].
+    std::vector<real_t> frequency_samples;
 
     unsigned order()  const { return static_cast<unsigned>(h.size()) - 1; }
     unsigned length() const { return static_cast<unsigned>(h.size()); }
@@ -94,6 +103,64 @@ struct FirstOrder {
                          // −1 → (1 − z⁻¹), нуль z = +1
 };
 
+// Низкопорядковый подфильтр, полученный устойчивым объединением нескольких
+// корневых сомножителей в повышенной точности. Такие блоки нужны, когда
+// отдельное округление каждого близкого корня в double разрушает каскад.
+struct CascadeBlock {
+    std::vector<real_t> coefficients;
+};
+
+enum class CascadeSectionKind {
+    FirstOrder,
+    Biquad,
+    Quartic,
+    Block
+};
+
+// Ссылка на типизированное звено и его runtime-масштаб. Поля
+// first_order/biquads/quartics сохраняют математическое представление,
+// а этот список задаёт устойчивый порядок фактического исполнения.
+struct CascadeSectionPlacement {
+    CascadeSectionKind kind;
+    std::size_t index;
+    real_t scale;
+};
+
+enum class CascadeBuildStatus {
+    Unspecified,
+    AnalyticalReduction,
+    ShortBlockCascade,
+    HighPrecisionShortBlockCascade,
+    FullOrderFactorBlock,
+    DirectFormFallback,
+    Failed
+};
+
+// Численные свидетельства, по которым вызывающий код может отличить
+// короткий каскад от безопасного отката к прямой форме.
+struct CascadeDiagnostics {
+    CascadeBuildStatus status = CascadeBuildStatus::Unspecified;
+
+    bool complement_verified = false;
+    real_t complement_identity_error =
+        std::numeric_limits<real_t>::infinity();
+
+    bool roots_verified = false;
+    unsigned root_iterations = 0;
+    real_t root_backward_error =
+        std::numeric_limits<real_t>::infinity();
+    real_t root_rebuild_error =
+        std::numeric_limits<real_t>::infinity();
+
+    bool runtime_verified = false;
+    real_t runtime_impulse_error =
+        std::numeric_limits<real_t>::infinity();
+    real_t runtime_peak_internal =
+        std::numeric_limits<real_t>::infinity();
+    unsigned selected_max_block_order = 0;
+    unsigned runtime_decimal_digits = 0;
+};
+
 // ═══════════════════════════════════════════════════════════════
 //  Результат каскадной декомпозиции
 // ═══════════════════════════════════════════════════════════════
@@ -102,14 +169,28 @@ struct CascadeDecomposition {
     std::vector<FirstOrder> first_order;   // звенья 1-го порядка
     std::vector<Biquad>     biquads;       // звенья 2-го порядка
     std::vector<Quartic>    quartics;      // звенья 4-го порядка
+    std::vector<CascadeBlock> blocks;      // адаптивно объединённые подфильтры
     std::vector<real_t>     remainder;     // полином-остаток h_rem[0..M-1]
-    real_t                  gain;          // общий коэффициент усиления
+    real_t                  gain = 1.0;    // коэффициент математического представления
+
+    // Если список непуст, CascadeFilterState применяет звенья именно
+    // в этом порядке и с указанными масштабами. runtime_gain уже
+    // учитывает эти масштабы и не обязан совпадать с gain.
+    std::vector<CascadeSectionPlacement> execution_order;
+    real_t runtime_gain = 1.0;
+    CascadeDiagnostics diagnostics;
 
     // Общее число выделенных нулей
     unsigned zeros_extracted() const {
-        return static_cast<unsigned>(first_order.size())
+        unsigned count = static_cast<unsigned>(first_order.size())
              + static_cast<unsigned>(biquads.size()) * 2
              + static_cast<unsigned>(quartics.size()) * 4;
+        for (const auto& block : blocks) {
+            if (!block.coefficients.empty()) {
+                count += static_cast<unsigned>(block.coefficients.size() - 1);
+            }
+        }
+        return count;
     }
 };
 
@@ -146,6 +227,15 @@ struct DoubleFilterState {
     void reset();
 };
 
+// Внутренний полиморфный backend для редких каскадов, которым недостаточно
+// аппаратного long double. Конкретный multiprecision-тип скрыт в .cpp.
+struct CascadeExtendedState {
+    virtual ~CascadeExtendedState() = default;
+    virtual double push(double x) = 0;
+    virtual void reset() = 0;
+    virtual long double peak() const = 0;
+};
+
 // ═══════════════════════════════════════════════════════════════
 //  Состояние каскадного КИХ-фильтра
 // ═══════════════════════════════════════════════════════════════
@@ -170,15 +260,30 @@ struct CascadeFilterState {
         real_t scale_inv;
         double d1, d2, d3, d4;     // x[n-1] ... x[n-4], в double
     };
+    struct BlockState {
+        std::vector<real_t> coefficients;
+        std::vector<long double> delay;
+    };
 
     std::vector<FirstOrderState> fo_states;
     std::vector<BiquadState>     bq_states;
     std::vector<QuarticState>    qt_states;
+    std::vector<BlockState>      block_states;
+    std::vector<CascadeSectionPlacement> execution_order;
     DoubleFilterState            rem_state;    // фильтр-остаток (double!)
     real_t                       gain;
+    long double                 peak_internal;
+    std::unique_ptr<CascadeExtendedState> extended_state;
+
+    CascadeFilterState() = default;
+    CascadeFilterState(const CascadeFilterState&) = delete;
+    CascadeFilterState& operator=(const CascadeFilterState&) = delete;
+    CascadeFilterState(CascadeFilterState&&) = default;
+    CascadeFilterState& operator=(CascadeFilterState&&) = default;
 
     void init(const CascadeDecomposition& dec);
     sample_t push(sample_t x);
+    double push_double(double x);
     void reset();
 };
 
@@ -247,15 +352,14 @@ CascadeDecomposition decompose(const DirectFIR& fir,
 CascadeDecomposition decompose_exact_fs(const DirectFIR& fir,
                                         bool interleave_order = true);
 
-//  Conservative exact-first residual reduction.
-//  Пытается сократить остаток только теми секциями, которые проходят
-//  численные проверки; иначе возвращается к stage-1 результату.
+//  Совместимый псевдоним полного exact-first пути. Сохранён для старого API;
+//  отдельного structured-алгоритма больше нет.
 CascadeDecomposition decompose_exact_fs_structured(const DirectFIR& fir,
                                                    bool interleave_order = true);
 
 //  Full exact-first path.
-//  Стартует со stage-1, затем пробует более глубокую факторизацию
-//  уменьшенного остатка и возвращает лучший допустимый результат.
+//  Строит остаток без последовательной дефляции, одновременно уточняет весь
+//  набор его корней и адаптивно объединяет сомножители в устойчивые блоки.
 CascadeDecomposition decompose_exact_fs_full(const DirectFIR& fir,
                                              bool interleave_order = true);
 
@@ -275,6 +379,13 @@ std::vector<sample_t> filter_direct(const DirectFIR& fir,
 //  Каскадная фильтрация — собственная реализация
 std::vector<sample_t> filter_cascade(const CascadeDecomposition& dec,
                                      const std::vector<sample_t>& x);
+
+// Double-варианты нужны для проверки самого каскада без маскировки
+// ошибки финальным округлением каждого выхода в sample_t=float.
+std::vector<double> filter_direct_double(const DirectFIR& fir,
+                                         const std::vector<double>& x);
+std::vector<double> filter_cascade_double(const CascadeDecomposition& dec,
+                                          const std::vector<double>& x);
 
 // ═══════════════════════════════════════════════════════════════
 //  API: генерация сигналов

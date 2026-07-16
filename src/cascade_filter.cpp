@@ -18,19 +18,18 @@
 //  Полином-остаток фильтруется прямой свёрткой (через
 //  DirectFilterState).
 //
-//  ВАЖНО: все промежуточные отсчёты между звеньями хранятся
-//  в формате double, а не float.  Это устраняет накопление
-//  ошибок округления при прохождении сигнала через 10+
-//  последовательных звеньев.  Конвертация в sample_t (float)
-//  выполняется только на выходе каскада.
-//
-//  Без этой меры SNR каскад/прямая ≈ 37 дБ (при float).
-//  С double промежуточными SNR ≈ 120+ дБ.
+//  Обычный путь использует double/long double. Для декомпозиций с
+//  явно указанным runtime_decimal_digits=50 создаётся отдельное
+//  Boost.Multiprecision-состояние; выбор точности не скрывается от API.
 //
 //  Собственная реализация настоящей работы.
 // ═══════════════════════════════════════════════════════════════
 
 #include "cascade_fir.h"
+
+#include <boost/multiprecision/cpp_bin_float.hpp>
+
+#include <stdexcept>
 
 namespace {
 
@@ -51,6 +50,118 @@ static real_t stage_scale_quartic(real_t alpha, real_t beta)
     const real_t l1 = 2.0 + 2.0 * std::abs(alpha) + std::abs(beta);
     return std::max<real_t>(1.0, l1);
 }
+
+using runtime_mp = boost::multiprecision::number<
+    boost::multiprecision::cpp_bin_float<50>>;
+
+class MultiprecisionCascadeState final : public CascadeExtendedState {
+public:
+    explicit MultiprecisionCascadeState(const CascadeDecomposition& dec)
+        : execution_order_(dec.execution_order), gain_(dec.runtime_gain)
+    {
+        blocks_.resize(dec.blocks.size());
+        for (size_t i = 0; i < dec.blocks.size(); ++i) {
+            for (double coefficient : dec.blocks[i].coefficients) {
+                blocks_[i].coefficients.emplace_back(coefficient);
+            }
+            const size_t order = dec.blocks[i].coefficients.empty()
+                ? 0 : dec.blocks[i].coefficients.size() - 1;
+            blocks_[i].delay.assign(order, runtime_mp(0));
+        }
+
+        for (double coefficient : dec.remainder) {
+            remainder_coefficients_.emplace_back(coefficient);
+        }
+        const size_t remainder_order = dec.remainder.empty()
+            ? 0 : dec.remainder.size() - 1;
+        remainder_delay_.assign(remainder_order, runtime_mp(0));
+
+        for (const CascadeSectionPlacement& placement : execution_order_) {
+            if (placement.kind != CascadeSectionKind::Block
+                || placement.index >= blocks_.size()) {
+                throw std::invalid_argument(
+                    "multiprecision runtime requires a block-only execution order");
+            }
+        }
+    }
+
+    double push(double x) override
+    {
+        runtime_mp value(x);
+        update_peak(value);
+        for (const CascadeSectionPlacement& placement : execution_order_) {
+            Block& block = blocks_[placement.index];
+            runtime_mp output = block.coefficients.empty()
+                ? value : block.coefficients[0] * value;
+            for (size_t i = 1; i < block.coefficients.size(); ++i) {
+                output += block.coefficients[i] * block.delay[i - 1];
+            }
+            for (size_t i = block.delay.size(); i-- > 1;) {
+                block.delay[i] = block.delay[i - 1];
+            }
+            if (!block.delay.empty()) {
+                block.delay[0] = value;
+            }
+            value = output * runtime_mp(placement.scale);
+            update_peak(value);
+        }
+
+        if (remainder_coefficients_.size() == 1) {
+            value *= remainder_coefficients_[0];
+        } else if (!remainder_coefficients_.empty()) {
+            runtime_mp output = remainder_coefficients_[0] * value;
+            for (size_t i = 1; i < remainder_coefficients_.size(); ++i) {
+                output += remainder_coefficients_[i] * remainder_delay_[i - 1];
+            }
+            for (size_t i = remainder_delay_.size(); i-- > 1;) {
+                remainder_delay_[i] = remainder_delay_[i - 1];
+            }
+            if (!remainder_delay_.empty()) {
+                remainder_delay_[0] = value;
+            }
+            value = output;
+        }
+
+        value *= gain_;
+        update_peak(value);
+        return static_cast<double>(value);
+    }
+
+    void reset() override
+    {
+        for (Block& block : blocks_) {
+            std::fill(block.delay.begin(), block.delay.end(), runtime_mp(0));
+        }
+        std::fill(
+            remainder_delay_.begin(), remainder_delay_.end(), runtime_mp(0));
+        peak_ = 0.0L;
+    }
+
+    long double peak() const override
+    {
+        return peak_;
+    }
+
+private:
+    struct Block {
+        std::vector<runtime_mp> coefficients;
+        std::vector<runtime_mp> delay;
+    };
+
+    void update_peak(const runtime_mp& value)
+    {
+        const long double magnitude =
+            static_cast<long double>(abs(value));
+        peak_ = std::max(peak_, magnitude);
+    }
+
+    std::vector<Block> blocks_;
+    std::vector<CascadeSectionPlacement> execution_order_;
+    std::vector<runtime_mp> remainder_coefficients_;
+    std::vector<runtime_mp> remainder_delay_;
+    runtime_mp gain_;
+    long double peak_ = 0.0L;
+};
 
 } // namespace
 
@@ -124,27 +235,51 @@ void CascadeFilterState::init(const CascadeDecomposition& dec)
     // амплитуд в длинных каскадах. Для каждого звена используем
     // безопасную верхнюю оценку его усиления через L1-норму
     // коэффициентов и переносим компенсацию в общий gain.
+    execution_order = dec.execution_order;
+    peak_internal = 0.0L;
+    extended_state.reset();
+    fo_states.clear();
+    bq_states.clear();
+    qt_states.clear();
+    block_states.clear();
+    if (dec.diagnostics.runtime_decimal_digits != 0) {
+        if (dec.diagnostics.runtime_decimal_digits != 50) {
+            throw std::invalid_argument(
+                "unsupported cascade runtime precision");
+        }
+        extended_state =
+            std::make_unique<MultiprecisionCascadeState>(dec);
+        gain = 1.0;
+        return;
+    }
+    const bool has_explicit_order = !execution_order.empty();
     long double gain_acc = static_cast<long double>(dec.gain);
 
     // Звенья 1-го порядка
     fo_states.resize(dec.first_order.size());
     for (size_t i = 0; i < dec.first_order.size(); ++i) {
         fo_states[i].sign = dec.first_order[i].sign;
-        const real_t scale = stage_scale_first_order(dec.first_order[i].sign);
+        const real_t scale = has_explicit_order
+            ? 1.0 : stage_scale_first_order(dec.first_order[i].sign);
         fo_states[i].scale_inv = 1.0 / scale;
         fo_states[i].d1   = 0.0;
-        gain_acc *= static_cast<long double>(scale);
+        if (!has_explicit_order) {
+            gain_acc *= static_cast<long double>(scale);
+        }
     }
 
     // Звенья 2-го порядка
     bq_states.resize(dec.biquads.size());
     for (size_t i = 0; i < dec.biquads.size(); ++i) {
         bq_states[i].gamma = dec.biquads[i].gamma;
-        const real_t scale = stage_scale_biquad(dec.biquads[i].gamma);
+        const real_t scale = has_explicit_order
+            ? 1.0 : stage_scale_biquad(dec.biquads[i].gamma);
         bq_states[i].scale_inv = 1.0 / scale;
         bq_states[i].d1    = 0.0;
         bq_states[i].d2    = 0.0;
-        gain_acc *= static_cast<long double>(scale);
+        if (!has_explicit_order) {
+            gain_acc *= static_cast<long double>(scale);
+        }
     }
 
     // Звенья 4-го порядка (палиндромные quartic-секции)
@@ -152,21 +287,35 @@ void CascadeFilterState::init(const CascadeDecomposition& dec)
     for (size_t i = 0; i < dec.quartics.size(); ++i) {
         qt_states[i].alpha = dec.quartics[i].alpha;
         qt_states[i].beta  = dec.quartics[i].beta;
-        const real_t scale = stage_scale_quartic(dec.quartics[i].alpha,
-                                                 dec.quartics[i].beta);
+        const real_t scale = has_explicit_order
+            ? 1.0 : stage_scale_quartic(dec.quartics[i].alpha,
+                                        dec.quartics[i].beta);
         qt_states[i].scale_inv = 1.0 / scale;
         qt_states[i].d1 = 0.0;
         qt_states[i].d2 = 0.0;
         qt_states[i].d3 = 0.0;
         qt_states[i].d4 = 0.0;
-        gain_acc *= static_cast<long double>(scale);
+        if (!has_explicit_order) {
+            gain_acc *= static_cast<long double>(scale);
+        }
+    }
+
+    // Фильтр-остаток (прямая свёртка)
+    block_states.resize(dec.blocks.size());
+    for (size_t i = 0; i < dec.blocks.size(); ++i) {
+        block_states[i].coefficients = dec.blocks[i].coefficients;
+        const size_t order = dec.blocks[i].coefficients.empty()
+            ? 0 : dec.blocks[i].coefficients.size() - 1;
+        block_states[i].delay.assign(order, 0.0);
     }
 
     // Фильтр-остаток (прямая свёртка)
     rem_state.init(dec.remainder);
 
     // Общий коэффициент усиления
-    gain = static_cast<real_t>(gain_acc);
+    gain = has_explicit_order
+        ? dec.runtime_gain
+        : static_cast<real_t>(gain_acc);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -175,6 +324,11 @@ void CascadeFilterState::init(const CascadeDecomposition& dec)
 
 void CascadeFilterState::reset()
 {
+    peak_internal = 0.0L;
+    if (extended_state) {
+        extended_state->reset();
+        return;
+    }
     for (auto& fo : fo_states) {
         fo.d1 = 0.0;
     }
@@ -187,6 +341,9 @@ void CascadeFilterState::reset()
         qt.d2 = 0.0;
         qt.d3 = 0.0;
         qt.d4 = 0.0;
+    }
+    for (auto& block : block_states) {
+        std::fill(block.delay.begin(), block.delay.end(), 0.0);
     }
     rem_state.reset();
 }
@@ -215,14 +372,73 @@ void CascadeFilterState::reset()
 //  на входе (float→double) и на выходе (double→float).
 // ═══════════════════════════════════════════════════════════════
 
-sample_t CascadeFilterState::push(sample_t x)
+double CascadeFilterState::push_double(double x)
 {
-    double val = static_cast<double>(x);
+    if (extended_state) {
+        const double output = extended_state->push(x);
+        peak_internal = extended_state->peak();
+        return output;
+    }
+    long double val = static_cast<long double>(x);
+    peak_internal = std::max(peak_internal, std::abs(val));
+
+    if (!execution_order.empty()) {
+        for (const auto& placement : execution_order) {
+            switch (placement.kind) {
+            case CascadeSectionKind::FirstOrder: {
+                auto& fo = fo_states[placement.index];
+                const double in = static_cast<double>(val);
+                val = (in + static_cast<double>(fo.sign) * fo.d1)
+                    * placement.scale;
+                fo.d1 = in;
+                break;
+            }
+            case CascadeSectionKind::Biquad: {
+                auto& bq = bq_states[placement.index];
+                const double in = static_cast<double>(val);
+                val = (in - bq.gamma * bq.d1 + bq.d2)
+                    * placement.scale;
+                bq.d2 = bq.d1;
+                bq.d1 = in;
+                break;
+            }
+            case CascadeSectionKind::Quartic: {
+                auto& qt = qt_states[placement.index];
+                const double in = static_cast<double>(val);
+                val = ((in + qt.d4) - qt.alpha * (qt.d1 + qt.d3)
+                    + qt.beta * qt.d2) * placement.scale;
+                qt.d4 = qt.d3;
+                qt.d3 = qt.d2;
+                qt.d2 = qt.d1;
+                qt.d1 = in;
+                break;
+            }
+            case CascadeSectionKind::Block: {
+                auto& block = block_states[placement.index];
+                long double out = block.coefficients.empty()
+                    ? val : static_cast<long double>(block.coefficients[0]) * val;
+                for (size_t i = 1; i < block.coefficients.size(); ++i) {
+                    out += static_cast<long double>(block.coefficients[i])
+                         * block.delay[i - 1];
+                }
+                for (size_t i = block.delay.size(); i-- > 1;) {
+                    block.delay[i] = block.delay[i - 1];
+                }
+                if (!block.delay.empty()) {
+                    block.delay[0] = val;
+                }
+                val = out * static_cast<long double>(placement.scale);
+                break;
+            }
+            }
+            peak_internal = std::max(peak_internal, std::abs(val));
+        }
+    } else {
 
     // ── Звенья 1-го порядка ──────────────────────────────────
     //  d1 хранится в double — без потери точности между звеньями.
     for (auto& fo : fo_states) {
-        double in = val;
+        double in = static_cast<double>(val);
         double s  = static_cast<double>(fo.sign);
         val = (in + s * fo.d1) * fo.scale_inv;
         fo.d1 = in;          // double ← double, без округления
@@ -232,7 +448,7 @@ sample_t CascadeFilterState::push(sample_t x)
     //  d1, d2 хранятся в double — без потери точности.
     //  gamma тоже double (поле структуры Biquad).
     for (auto& bq : bq_states) {
-        double in = val;
+        double in = static_cast<double>(val);
         double g  = bq.gamma;
         val = (in - g * bq.d1 + bq.d2) * bq.scale_inv;
         bq.d2 = bq.d1;       // double ← double
@@ -246,7 +462,7 @@ sample_t CascadeFilterState::push(sample_t x)
     //  Умножений: 2 (на α и β), сложений: 4.
     //  d1..d4 хранятся в double.
     for (auto& qt : qt_states) {
-        double in = val;
+        double in = static_cast<double>(val);
         double a  = qt.alpha;
         double b  = qt.beta;
         val = ((in + qt.d4) - a * (qt.d1 + qt.d3) + b * qt.d2) * qt.scale_inv;
@@ -254,6 +470,7 @@ sample_t CascadeFilterState::push(sample_t x)
         qt.d3 = qt.d2;
         qt.d2 = qt.d1;
         qt.d1 = in;
+    }
     }
 
     // ── Фильтр-остаток (прямая свёртка) ─────────────────────
@@ -266,16 +483,22 @@ sample_t CascadeFilterState::push(sample_t x)
     // поэтому потери точности на границе каскад→остаток нет.
     if (rem_state.h.size() <= 1) {
         if (!rem_state.h.empty()) {
-            val *= rem_state.h[0];
+            val *= static_cast<long double>(rem_state.h[0]);
         }
     } else {
-        val = rem_state.push(val);
+        val = rem_state.push(static_cast<double>(val));
     }
 
     // ── Коэффициент усиления ─────────────────────────────────
-    val *= gain;
+    val *= static_cast<long double>(gain);
+    peak_internal = std::max(peak_internal, std::abs(val));
 
-    return static_cast<sample_t>(val);
+    return static_cast<double>(val);
+}
+
+sample_t CascadeFilterState::push(sample_t x)
+{
+    return static_cast<sample_t>(push_double(static_cast<double>(x)));
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -298,5 +521,18 @@ std::vector<sample_t> filter_cascade(const CascadeDecomposition& dec,
         y[m] = state.push(x[m]);
     }
 
+    return y;
+}
+
+std::vector<double> filter_cascade_double(const CascadeDecomposition& dec,
+                                          const std::vector<double>& x)
+{
+    CascadeFilterState state;
+    state.init(dec);
+
+    std::vector<double> y(x.size(), 0.0);
+    for (size_t n = 0; n < x.size(); ++n) {
+        y[n] = state.push_double(x[n]);
+    }
     return y;
 }

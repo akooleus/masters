@@ -15,11 +15,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # ── External dependencies ─────────────────────────────────────
-find_library(FFTW3_LIB fftw3 REQUIRED)
-find_path(FFTW3_INCLUDE fftw3.h)
-
 if(CASCADE_BUILD_EXACT_FS)
-    find_library(QUADMATH_LIB quadmath REQUIRED)
     find_library(LAPACK_LIB lapack REQUIRED)
 endif()
 
@@ -38,17 +34,12 @@ set(CASCADE_COMMON_SOURCES
 function(configure_cascade_target target)
     target_link_libraries(${target} PRIVATE
         cascade_core
-        ${FFTW3_LIB}
         m
-    )
-    target_include_directories(${target} PRIVATE
-        ${FFTW3_INCLUDE}
     )
 endfunction()
 
 function(link_extended_backend target)
     target_link_libraries(${target} PRIVATE
-        ${QUADMATH_LIB}
         ${LAPACK_LIB}
     )
 endfunction()
@@ -116,9 +107,6 @@ if(BUILD_TESTING)
         )
         add_exact_fs_test(decompose_exact_fs_full_test
             tests/exact/decompose_exact_fs_full_test.cpp
-        )
-        add_exact_fs_test(decompose_exact_fs_structured_test
-            tests/exact/decompose_exact_fs_structured_test.cpp
         )
     endif()
 endif()

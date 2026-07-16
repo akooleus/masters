@@ -1,36 +1,34 @@
-// ═══════════════════════════════════════════════════════════════
-//  decompose_exact_fs.cpp
+// Stable decomposition of linear-phase frequency-sampling FIR filters.
 //
-//  Exact-first decomposition family for frequency-sampling FIR filters.
+// The known unit-circle zeros are removed with the complementary-polynomial
+// identity from Aliphas, Narayan and Peterson (1983):
 //
-//  This file contains three public entry points:
-//    1. decompose_exact_fs            — exact stage-1 extraction
-//    2. decompose_exact_fs_structured — conservative residual reduction
-//    3. decompose_exact_fs_full       — best-effort fuller factorization
+//   H = H0 H1,        1 - z^-N = H0 H2
+//   ------------------------------------------------
+//                 H H2 = H1 (1 - z^-N)
 //
-//  The core idea is exact-first:
-//    detect structurally known zero-valued H[k] samples,
-//    convert them into exact UC factors,
-//    extract them stably in __float128,
-//    and only then touch the smaller residual polynomial.
-// ═══════════════════════════════════════════════════════════════
+// Hence H1 is the first coefficient block of the convolution H * H2.  No
+// deflation by H0 is performed.  The reduced palindromic H1 is factored in
+// the Chebyshev basis with a colleague-matrix seed followed by a simultaneous
+// multiprecision Aberth-Ehrlich refinement.
 
 #include "cascade_fir.h"
 
-#include <quadmath.h>
+#include <boost/multiprecision/cpp_bin_float.hpp>
+#include <boost/multiprecision/cpp_complex.hpp>
 
+#include <algorithm>
 #include <complex>
-#include <iostream>
 #include <limits>
-#include <vector>
+#include <numeric>
+#include <stdexcept>
+#include <utility>
 
 namespace {
 
-using quad = __float128;
-
-void enforce_palindromic_symmetry_q128(std::vector<quad>& h);
-
-using cx = std::complex<long double>;
+using mp_real = boost::multiprecision::number<
+    boost::multiprecision::cpp_bin_float<200>>;
+using mp_complex = boost::multiprecision::cpp_complex<200>;
 
 extern "C" {
 void dgeev_(const char* jobvl, const char* jobvr,
@@ -41,102 +39,21 @@ void dgeev_(const char* jobvl, const char* jobvr,
             double* work, const int* lwork, int* info);
 }
 
-struct ExactStopbandInfo {
-    std::vector<unsigned> pair_k;
-    bool has_dc_zero = false;
-    bool has_nyq_zero = false;
-};
-
-ExactStopbandInfo find_exact_stopband_zeros(const DirectFIR& fir)
+const mp_real& mp_pi()
 {
-    ExactStopbandInfo info;
-
-    const unsigned N = fir.length();
-    const unsigned k_half = N / 2;
-
-    long double max_abs = 0.0L;
-    std::vector<long double> mags(k_half + 1, 0.0L);
-
-    for (unsigned k = 0; k <= k_half; ++k) {
-        const long double theta =
-            2.0L * static_cast<long double>(PI)
-            * static_cast<long double>(k)
-            / static_cast<long double>(N);
-
-        const std::complex<long double> z_inv = std::polar(1.0L, -theta);
-
-        std::complex<long double> z_pow = 1.0L;
-        std::complex<long double> acc = 0.0L;
-        for (real_t coeff : fir.h) {
-            acc += static_cast<long double>(coeff) * z_pow;
-            z_pow *= z_inv;
-        }
-
-        const long double mag = std::abs(acc);
-        mags[k] = mag;
-        if (mag > max_abs) {
-            max_abs = mag;
-        }
-    }
-
-    const long double zero_tol = std::max(1e-18L, max_abs * 1e-12L);
-    for (unsigned k = 0; k <= k_half; ++k) {
-        if (mags[k] > zero_tol) {
-            continue;
-        }
-
-        if (k == 0) {
-            info.has_dc_zero = true;
-        } else if (N % 2 == 0 && k == k_half) {
-            info.has_nyq_zero = true;
-        } else {
-            info.pair_k.push_back(k);
-        }
-    }
-
-    return info;
+    static const mp_real value = acos(mp_real(-1));
+    return value;
 }
 
-std::vector<unsigned> interleave_indices(std::vector<unsigned> indices)
-{
-    std::sort(indices.begin(), indices.end());
-
-    std::vector<unsigned> order;
-    order.reserve(indices.size());
-
-    if (indices.empty()) {
-        return order;
-    }
-
-    size_t lo = 0;
-    size_t hi = indices.size() - 1;
-    bool take_lo = true;
-
-    while (lo <= hi) {
-        if (take_lo) {
-            order.push_back(indices[lo]);
-            ++lo;
-        } else {
-            order.push_back(indices[hi]);
-            if (hi == 0) {
-                break;
-            }
-            --hi;
-        }
-        take_lo = !take_lo;
-    }
-
-    return order;
-}
-
-std::vector<quad> q128_poly_multiply(const std::vector<quad>& a,
-                                     const std::vector<quad>& b)
+template <class T>
+std::vector<T> poly_multiply_t(const std::vector<T>& a,
+                               const std::vector<T>& b)
 {
     if (a.empty() || b.empty()) {
         return {};
     }
 
-    std::vector<quad> c(a.size() + b.size() - 1, 0.0Q);
+    std::vector<T> c(a.size() + b.size() - 1, T(0));
     for (size_t i = 0; i < a.size(); ++i) {
         for (size_t j = 0; j < b.size(); ++j) {
             c[i + j] += a[i] * b[j];
@@ -145,905 +62,1229 @@ std::vector<quad> q128_poly_multiply(const std::vector<quad>& a,
     return c;
 }
 
-std::vector<quad> build_exact_factor_product_q128(const CascadeDecomposition& dec)
+template <class T>
+std::vector<T> balanced_product(std::vector<std::vector<T>> factors)
 {
-    std::vector<quad> product = {1.0Q};
-
-    for (const auto& fo : dec.first_order) {
-        const std::vector<quad> factor = {
-            1.0Q,
-            static_cast<quad>(fo.sign)
-        };
-        product = q128_poly_multiply(product, factor);
+    if (factors.empty()) {
+        return {T(1)};
     }
 
-    for (const auto& bq : dec.biquads) {
-        const std::vector<quad> factor = {
-            1.0Q,
-            -static_cast<quad>(bq.gamma),
-            1.0Q
-        };
-        product = q128_poly_multiply(product, factor);
+    while (factors.size() > 1) {
+        std::vector<std::vector<T>> next;
+        next.reserve((factors.size() + 1) / 2);
+        for (size_t i = 0; i < factors.size(); i += 2) {
+            if (i + 1 < factors.size()) {
+                next.push_back(poly_multiply_t(factors[i], factors[i + 1]));
+            } else {
+                next.push_back(std::move(factors[i]));
+            }
+        }
+        factors = std::move(next);
     }
-
-    return product;
+    return std::move(factors.front());
 }
 
-std::pair<std::vector<quad>, std::vector<quad>>
-q128_poly_divide(const std::vector<quad>& a,
-                 const std::vector<quad>& b)
+void enforce_palindrome(std::vector<mp_real>& p)
 {
-    const size_t na = a.size();
-    const size_t nb = b.size();
-
-    if (nb == 0 || na < nb || fabsq(b[0]) < 1e-34Q) {
-        return {{}, a};
+    for (size_t i = 0; i < p.size() / 2; ++i) {
+        const mp_real avg = (p[i] + p[p.size() - 1 - i]) / 2;
+        p[i] = avg;
+        p[p.size() - 1 - i] = avg;
     }
+}
 
-    std::vector<quad> r = a;
-    const size_t qlen = na - nb + 1;
-    std::vector<quad> q(qlen, 0.0Q);
+mp_real max_abs(const std::vector<mp_real>& p)
+{
+    mp_real result = 0;
+    for (const mp_real& v : p) {
+        result = std::max(result, abs(v));
+    }
+    return result;
+}
 
-    for (size_t i = 0; i < qlen; ++i) {
-        q[i] = r[i] / b[0];
-        for (size_t j = 0; j < nb; ++j) {
-            r[i + j] -= q[i] * b[j];
+std::vector<unsigned> interleave_indices(std::vector<unsigned> indices)
+{
+    std::sort(indices.begin(), indices.end());
+    std::vector<unsigned> order;
+    order.reserve(indices.size());
+
+    size_t lo = 0;
+    size_t hi = indices.size();
+    while (lo < hi) {
+        order.push_back(indices[lo++]);
+        if (lo < hi) {
+            order.push_back(indices[--hi]);
         }
     }
-
-    std::vector<quad> rem(r.begin() + static_cast<long>(qlen), r.end());
-    return {std::move(q), std::move(rem)};
+    return order;
 }
 
-void q128_first_order_half_divide(const std::vector<quad>& h,
-                                  int sign,
-                                  std::vector<quad>& q)
+std::vector<bool> exact_zero_mask(const DirectFIR& fir)
 {
-    const size_t len = h.size();
-    if (len < 2) {
-        q = h;
-        return;
-    }
+    const unsigned N = fir.length();
+    const unsigned half = N / 2;
+    std::vector<bool> zero(half + 1, false);
 
-    const size_t qlen = len - 1;
-    q.resize(qlen);
-
-    const size_t mid = (qlen - 1) / 2;
-    const quad s = static_cast<quad>(sign);
-
-    q[0] = h[0];
-    for (size_t n = 1; n <= mid; ++n) {
-        q[n] = h[n] - s * q[n - 1];
-    }
-
-    for (size_t n = 0; n < qlen / 2; ++n) {
-        q[qlen - 1 - n] = q[n];
-    }
-}
-
-void q128_biquad_half_divide(const std::vector<quad>& h,
-                             quad gamma,
-                             std::vector<quad>& q)
-{
-    const size_t len = h.size();
-    if (len < 4) {
-        q = h;
-        return;
-    }
-
-    const size_t qlen = len - 2;
-    q.resize(qlen);
-
-    const size_t mid = (qlen - 1) / 2;
-
-    q[0] = h[0];
-    if (qlen >= 2) {
-        q[1] = h[1] + gamma * q[0];
-    }
-    for (size_t n = 2; n <= mid; ++n) {
-        q[n] = h[n] + gamma * q[n - 1] - q[n - 2];
-    }
-
-    if (qlen % 2 == 0 && qlen >= 4) {
-        const size_t center = qlen / 2;
-        if (center > mid) {
-            q[center] = h[center] + gamma * q[center - 1] - q[center - 2];
+    if (fir.frequency_samples.size() == N) {
+        for (unsigned k = 0; k <= half; ++k) {
+            zero[k] = (fir.frequency_samples[k] == 0.0);
         }
+        return zero;
     }
 
-    for (size_t n = 0; n < qlen / 2; ++n) {
-        q[qlen - 1 - n] = q[n];
+    // Compatibility path for a manually assembled DirectFIR.  It is not
+    // called "exact": without the original H[k], only numerical detection is
+    // possible.
+    long double max_mag = 0.0L;
+    std::vector<long double> mags(half + 1, 0.0L);
+    for (unsigned k = 0; k <= half; ++k) {
+        const long double theta =
+            2.0L * acosl(-1.0L) * static_cast<long double>(k)
+            / static_cast<long double>(N);
+        const std::complex<long double> step = std::polar(1.0L, -theta);
+        std::complex<long double> power = 1.0L;
+        std::complex<long double> value = 0.0L;
+        for (double h : fir.h) {
+            value += static_cast<long double>(h) * power;
+            power *= step;
+        }
+        mags[k] = std::abs(value);
+        max_mag = std::max(max_mag, mags[k]);
     }
+
+    const long double tol = std::max(1e-18L, max_mag * 1e-12L);
+    for (unsigned k = 0; k <= half; ++k) {
+        zero[k] = mags[k] <= tol;
+    }
+    return zero;
 }
 
-std::vector<quad> q128_compute_U_sequence(size_t count, quad gamma)
+std::vector<mp_real> design_impulse_mp(const DirectFIR& fir)
 {
-    std::vector<quad> U(count, 0.0Q);
-    if (count == 0) {
-        return U;
-    }
-
-    U[0] = 1.0Q;
-    if (count == 1) {
-        return U;
-    }
-
-    U[1] = gamma;
-    for (size_t n = 2; n < count; ++n) {
-        U[n] = gamma * U[n - 1] - U[n - 2];
-    }
-    return U;
-}
-
-quad q128_biquad_divisibility_delta(const std::vector<quad>& h,
-                                    quad gamma)
-{
-    const size_t len = h.size();
-    if (len < 3) {
-        return 0.0Q;
-    }
-
-    const size_t max_u = len - 2;
-    const std::vector<quad> U = q128_compute_U_sequence(max_u, gamma);
-
-    quad sum = -h[0];
-    for (size_t m = 0; m <= len - 3; ++m) {
-        sum += h[m] * U[len - 3 - m];
-    }
-    return sum;
-}
-
-void q128_correct_for_biquad_divisibility(std::vector<quad>& h,
-                                          quad gamma)
-{
-    const size_t len = h.size();
-    if (len < 3 || len % 2 == 0) {
-        return;
-    }
-
-    const quad delta = q128_biquad_divisibility_delta(h, gamma);
-    quad h_scale = 0.0Q;
-    for (quad x : h) {
-        const quad ax = fabsq(x);
-        if (ax > h_scale) {
-            h_scale = ax;
+    const unsigned N = fir.length();
+    if (fir.frequency_samples.size() != N) {
+        std::vector<mp_real> result;
+        result.reserve(fir.h.size());
+        for (double h : fir.h) {
+            result.emplace_back(h);
         }
+        return result;
     }
 
-    h_scale = std::max(1e-30Q, h_scale);
-    if (fabsq(delta) <= 1e-28Q * h_scale) {
-        return;
-    }
+    const mp_real alpha = mp_real(N - 1) / 2;
+    std::vector<mp_real> h(N, mp_real(fir.frequency_samples[0]));
+    const unsigned pair_last = (N % 2 == 0) ? N / 2 - 1 : N / 2;
 
-    const size_t center = len / 2;
-    const size_t u_idx = len - 3 - center;
-    const std::vector<quad> U = q128_compute_U_sequence(len - 2, gamma);
-    const quad denom = U[u_idx];
-
-    if (fabsq(denom) <= 1e-30Q) {
-        return;
-    }
-
-    h[center] -= delta / denom;
-    enforce_palindromic_symmetry_q128(h);
-}
-
-double q128_relative_rebuild_error(const std::vector<quad>& original,
-                                   const std::vector<quad>& quotient,
-                                   quad gamma)
-{
-    const std::vector<quad> factor = {1.0Q, -gamma, 1.0Q};
-    const std::vector<quad> rebuilt = q128_poly_multiply(quotient, factor);
-
-    const size_t len = std::max(original.size(), rebuilt.size());
-    quad max_abs = 0.0Q;
-    quad max_ref = 0.0Q;
-
-    for (size_t i = 0; i < len; ++i) {
-        const quad ref = (i < original.size()) ? original[i] : 0.0Q;
-        const quad cur = (i < rebuilt.size()) ? rebuilt[i] : 0.0Q;
-        const quad err = fabsq(ref - cur);
-        if (err > max_abs) {
-            max_abs = err;
-        }
-        const quad aref = fabsq(ref);
-        if (aref > max_ref) {
-            max_ref = aref;
-        }
-    }
-
-    max_ref = std::max(max_ref, 1e-30Q);
-    return static_cast<double>(max_abs / max_ref);
-}
-
-double q128_relative_rebuild_error_multi(
-    const std::vector<quad>& original,
-    const std::vector<quad>& quotient,
-    const std::vector<quad>& gammas,
-    unsigned n_factors)
-{
-    std::vector<quad> rebuilt = quotient;
-    for (unsigned i = 0; i < n_factors; ++i) {
-        rebuilt = q128_poly_multiply(rebuilt, {1.0Q, -gammas[i], 1.0Q});
-    }
-
-    const size_t len = std::max(original.size(), rebuilt.size());
-    quad max_abs = 0.0Q;
-    quad max_ref = 0.0Q;
-
-    for (size_t i = 0; i < len; ++i) {
-        const quad ref = (i < original.size()) ? original[i] : 0.0Q;
-        const quad cur = (i < rebuilt.size()) ? rebuilt[i] : 0.0Q;
-        const quad err = fabsq(ref - cur);
-        if (err > max_abs) {
-            max_abs = err;
-        }
-        const quad aref = fabsq(ref);
-        if (aref > max_ref) {
-            max_ref = aref;
-        }
-    }
-
-    max_ref = std::max(max_ref, 1e-30Q);
-    return static_cast<double>(max_abs / max_ref);
-}
-
-struct ExactPrefixTrial {
-    unsigned accepted_biquad_count = 0;
-    double rel_err = std::numeric_limits<double>::infinity();
-    std::vector<quad> quotient;
-};
-
-ExactPrefixTrial run_exact_prefix_trial(const std::vector<quad>& base_after_fo,
-                                        const std::vector<quad>& gamma_order_q,
-                                        unsigned refresh_interval,
-                                        double quality_threshold)
-{
-    ExactPrefixTrial out;
-    out.quotient = base_after_fo;
-
-    auto seq_divide_known_biquads = [&](unsigned count) -> std::vector<quad> {
-        std::vector<quad> cur = base_after_fo;
-        std::vector<quad> q;
-        for (unsigned j = 0; j < count; ++j) {
-            std::vector<quad> trial = cur;
-            q128_correct_for_biquad_divisibility(trial, gamma_order_q[j]);
-            q128_biquad_half_divide(trial, gamma_order_q[j], q);
-            enforce_palindromic_symmetry_q128(q);
-            cur = std::move(q);
-        }
-        return cur;
-    };
-
-    unsigned last_good = 0;
-    std::vector<quad> best_quotient = base_after_fo;
-    std::vector<quad> current = base_after_fo;
-    double best_err = 0.0;
-
-    for (unsigned i = 0; i < gamma_order_q.size(); ++i) {
-        std::vector<quad> trial = current;
-        q128_correct_for_biquad_divisibility(trial, gamma_order_q[i]);
-        std::vector<quad> next_q;
-        q128_biquad_half_divide(trial, gamma_order_q[i], next_q);
-        enforce_palindromic_symmetry_q128(next_q);
-        current = std::move(next_q);
-
-        const unsigned steps_in_block = (i + 1) - last_good;
-        const bool do_refresh =
-            (steps_in_block >= refresh_interval)
-            || (i + 1 == gamma_order_q.size());
-
-        if (!do_refresh) {
+    for (unsigned k = 1; k <= pair_last; ++k) {
+        const mp_real magnitude = mp_real(fir.frequency_samples[k]);
+        if (magnitude == 0) {
             continue;
         }
 
-        std::vector<quad> fresh = seq_divide_known_biquads(i + 1);
-        const double rel_err =
-            q128_relative_rebuild_error_multi(base_after_fo, fresh, gamma_order_q, i + 1);
+        const mp_real step = 2 * mp_pi() * k / N;
+        const mp_real phase0 = -step * alpha;
+        mp_real c = cos(phase0);
+        mp_real s = sin(phase0);
+        const mp_real c_step = cos(step);
+        const mp_real s_step = sin(step);
 
-        if (rel_err > quality_threshold) {
-            bool found = false;
-            for (unsigned try_end = i; try_end > last_good; --try_end) {
-                std::vector<quad> trial_q = seq_divide_known_biquads(try_end);
-                const double trial_err =
-                    q128_relative_rebuild_error_multi(
-                        base_after_fo, trial_q, gamma_order_q, try_end);
-                if (trial_err <= quality_threshold) {
-                    best_quotient = std::move(trial_q);
-                    out.accepted_biquad_count = try_end;
-                    out.rel_err = trial_err;
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                out.accepted_biquad_count = last_good;
-                out.rel_err = best_err;
-            }
-            out.quotient = std::move(best_quotient);
-            return out;
-        }
-
-        current = std::move(fresh);
-        best_quotient = current;
-        last_good = i + 1;
-        best_err = rel_err;
-        out.accepted_biquad_count = last_good;
-        out.rel_err = best_err;
-    }
-
-    out.quotient = std::move(best_quotient);
-    return out;
-}
-
-void enforce_palindromic_symmetry_q128(std::vector<quad>& h)
-{
-    for (size_t i = 0; i < h.size() / 2; ++i) {
-        const quad avg = 0.5Q * (h[i] + h[h.size() - 1 - i]);
-        h[i] = avg;
-        h[h.size() - 1 - i] = avg;
-    }
-}
-
-quad max_abs_value_q128(const std::vector<quad>& v)
-{
-    quad m = 0.0Q;
-    for (quad x : v) {
-        const quad ax = fabsq(x);
-        if (ax > m) {
-            m = ax;
+        for (unsigned n = 0; n < N; ++n) {
+            h[n] += 2 * magnitude * c;
+            const mp_real next_c = c * c_step - s * s_step;
+            const mp_real next_s = s * c_step + c * s_step;
+            c = next_c;
+            s = next_s;
         }
     }
-    return m;
-}
 
-std::vector<quad> real_to_q128(const std::vector<real_t>& v)
-{
-    std::vector<quad> out(v.size(), 0.0Q);
-    for (size_t i = 0; i < v.size(); ++i) {
-        out[i] = static_cast<quad>(v[i]);
+    if (N % 2 == 0 && fir.frequency_samples[N / 2] != 0.0) {
+        const mp_real magnitude = mp_real(fir.frequency_samples[N / 2]);
+        for (unsigned n = 0; n < N; ++n) {
+            h[n] += magnitude * cos(mp_pi() * (mp_real(n) - alpha));
+        }
     }
-    return out;
-}
 
-std::vector<real_t> q128_to_real(const std::vector<quad>& v)
-{
-    std::vector<real_t> out(v.size(), 0.0);
-    for (size_t i = 0; i < v.size(); ++i) {
-        out[i] = static_cast<real_t>(v[i]);
+    for (mp_real& value : h) {
+        value /= N;
     }
-    return out;
+    enforce_palindrome(h);
+    return h;
 }
 
-std::vector<quad> q128_palindrome_to_u_poly(const std::vector<quad>& Q)
+struct ComplementReduction {
+    CascadeDecomposition decomposition;
+    std::vector<mp_real> residual;
+    std::vector<mp_real> impulse;
+    unsigned known_zero_count = 0;
+    mp_real identity_error = 0;
+};
+
+ComplementReduction reduce_by_complement(const DirectFIR& fir,
+                                         bool interleave_order)
 {
-    int deg = static_cast<int>(Q.size()) - 1;
-    if (deg < 0) {
+    ComplementReduction result;
+    result.impulse = design_impulse_mp(fir);
+
+    if (fir.h.empty()) {
+        result.decomposition.remainder = {};
+        return result;
+    }
+
+    const unsigned N = fir.length();
+    const std::vector<bool> zero = exact_zero_mask(fir);
+    std::vector<std::vector<mp_real>> complement_factors;
+    std::vector<unsigned> known_pairs;
+
+    if (zero[0]) {
+        result.decomposition.first_order.push_back(FirstOrder{-1});
+        ++result.known_zero_count;
+    } else {
+        complement_factors.push_back({mp_real(1), mp_real(-1)});
+    }
+
+    const unsigned pair_last = (N % 2 == 0) ? N / 2 - 1 : N / 2;
+    for (unsigned k = 1; k <= pair_last; ++k) {
+        const mp_real gamma = 2 * cos(2 * mp_pi() * k / N);
+        if (zero[k]) {
+            known_pairs.push_back(k);
+            result.known_zero_count += 2;
+        } else {
+            complement_factors.push_back({mp_real(1), -gamma, mp_real(1)});
+        }
+    }
+
+    if (N % 2 == 0) {
+        if (zero[N / 2]) {
+            result.decomposition.first_order.push_back(FirstOrder{+1});
+            ++result.known_zero_count;
+        } else {
+            complement_factors.push_back({mp_real(1), mp_real(1)});
+        }
+    }
+
+    const std::vector<unsigned> output_order = interleave_order
+        ? interleave_indices(known_pairs)
+        : known_pairs;
+    for (unsigned k : output_order) {
+        const mp_real gamma = 2 * cos(2 * mp_pi() * k / N);
+        result.decomposition.biquads.push_back(
+            Biquad{static_cast<double>(gamma), k});
+    }
+
+    const std::vector<mp_real> H2 = balanced_product(std::move(complement_factors));
+    const std::vector<mp_real> product = poly_multiply_t(result.impulse, H2);
+    const unsigned residual_degree = (N - 1) - result.known_zero_count;
+    const size_t residual_size = static_cast<size_t>(residual_degree) + 1;
+
+    if (product.size() < residual_size) {
+        throw std::runtime_error("complement reduction produced a short convolution");
+    }
+
+    result.residual.assign(product.begin(), product.begin() + residual_size);
+    enforce_palindrome(result.residual);
+
+    // Verify H*H2 = H1 - z^-N H1 without expanding the ill-conditioned H0.
+    mp_real max_err = 0;
+    for (size_t i = 0; i < product.size(); ++i) {
+        mp_real expected = 0;
+        if (i < residual_size) {
+            expected += result.residual[i];
+        }
+        if (i >= N && i - N < residual_size) {
+            expected -= result.residual[i - N];
+        }
+        max_err = std::max(max_err, abs(product[i] - expected));
+    }
+    result.identity_error = max_err / std::max(mp_real("1e-90"), max_abs(product));
+
+    result.decomposition.diagnostics.status =
+        CascadeBuildStatus::AnalyticalReduction;
+    result.decomposition.diagnostics.complement_identity_error =
+        static_cast<double>(result.identity_error);
+    result.decomposition.diagnostics.complement_verified =
+        result.identity_error <= mp_real("1e-60");
+
+    result.decomposition.remainder.reserve(result.residual.size());
+    for (const mp_real& value : result.residual) {
+        result.decomposition.remainder.push_back(static_cast<double>(value));
+    }
+    result.decomposition.gain = 1.0;
+    result.decomposition.runtime_gain = 1.0;
+    return result;
+}
+
+std::vector<std::complex<double>> chebyshev_colleague_seeds(
+    const std::vector<mp_real>& coefficients)
+{
+    const int n = static_cast<int>(coefficients.size()) - 1;
+    if (n <= 0) {
         return {};
     }
-    if (deg % 2 != 0) {
+    if (n == 1) {
+        return {{
+            -static_cast<double>(coefficients[0] / coefficients[1]), 0.0
+        }};
+    }
+
+    const mp_real coefficient_scale = std::max(mp_real("1e-90"), max_abs(coefficients));
+    std::vector<double> c(coefficients.size(), 0.0);
+    for (size_t i = 0; i < coefficients.size(); ++i) {
+        c[i] = static_cast<double>(coefficients[i] / coefficient_scale);
+    }
+
+    if (!std::isfinite(c.back()) || c.back() == 0.0) {
         return {};
     }
 
-    const int M = deg / 2;
-    if (M == 0) {
-        return {Q[0]};
-    }
-
-    std::vector<quad> F(static_cast<size_t>(M + 1), 0.0Q);
-    F[0] = Q[static_cast<size_t>(M)];
-
-    std::vector<quad> s_prev2 = {2.0Q};
-    std::vector<quad> s_prev1 = {0.0Q, 1.0Q};
-
-    F[0] += Q[static_cast<size_t>(M) - 1] * s_prev1[0];
-    if (M >= 1) {
-        F[1] += Q[static_cast<size_t>(M) - 1] * s_prev1[1];
-    }
-
-    for (int k = 2; k <= M; ++k) {
-        const size_t len_k = static_cast<size_t>(k + 1);
-        std::vector<quad> s_cur(len_k, 0.0Q);
-
-        for (size_t j = 1; j < len_k && j - 1 < s_prev1.size(); ++j) {
-            s_cur[j] = s_prev1[j - 1];
-        }
-        for (size_t j = 0; j < s_prev2.size() && j < len_k; ++j) {
-            s_cur[j] -= s_prev2[j];
-        }
-
-        const quad weight = Q[static_cast<size_t>(M - k)];
-        for (size_t j = 0; j < len_k && j < F.size(); ++j) {
-            F[j] += weight * s_cur[j];
-        }
-
-        s_prev2 = std::move(s_prev1);
-        s_prev1 = std::move(s_cur);
-    }
-
-    return F;
-}
-
-std::vector<cx> companion_eigenvalues(const std::vector<double>& coeffs)
-{
-    const int M = static_cast<int>(coeffs.size()) - 1;
-    if (M <= 0) {
-        return {};
-    }
-    if (M == 1) {
-        return {cx(-static_cast<long double>(coeffs[0]) / static_cast<long double>(coeffs[1]),
-                   0.0L)};
-    }
-
-    auto coeff_spread = [](const std::vector<double>& c, double log2_scale) {
-        double min_log2 = std::numeric_limits<double>::infinity();
-        double max_log2 = -std::numeric_limits<double>::infinity();
-        for (size_t k = 0; k < c.size(); ++k) {
-            const double ak = std::abs(c[k]);
-            if (ak < 1e-300) {
-                continue;
-            }
-            const double lv = std::log2(ak) + static_cast<double>(k) * log2_scale;
-            min_log2 = std::min(min_log2, lv);
-            max_log2 = std::max(max_log2, lv);
-        }
-        if (!std::isfinite(min_log2) || !std::isfinite(max_log2)) {
-            return std::numeric_limits<double>::infinity();
-        }
-        return max_log2 - min_log2;
+    std::vector<double> matrix(static_cast<size_t>(n * n), 0.0);
+    auto A = [&](int row, int col) -> double& {
+        return matrix[static_cast<size_t>(row + col * n)];
     };
 
-    double best_log2_scale = 0.0;
-    double best_spread = coeff_spread(coeffs, 0.0);
-    for (int half_step = -64; half_step <= 64; ++half_step) {
-        const double log2_scale = 0.5 * static_cast<double>(half_step);
-        const double spread = coeff_spread(coeffs, log2_scale);
-        if (spread < best_spread) {
-            best_spread = spread;
-            best_log2_scale = log2_scale;
-        }
+    const double sqrt_half = std::sqrt(0.5);
+    A(0, 1) = sqrt_half;
+    A(1, 0) = sqrt_half;
+    for (int i = 1; i + 1 < n; ++i) {
+        A(i, i + 1) = 0.5;
+        A(i + 1, i) = 0.5;
     }
 
-    const double u_scale = std::exp2(best_log2_scale);
-    std::vector<double> balanced = coeffs;
-    if (std::abs(best_log2_scale) > 1e-12) {
-        double scale_pow = 1.0;
-        for (double& ck : balanced) {
-            ck *= scale_pow;
-            scale_pow *= u_scale;
-        }
+    const double scl_last = sqrt_half;
+    for (int row = 0; row < n; ++row) {
+        const double scl_row = (row == 0) ? 1.0 : sqrt_half;
+        A(row, n - 1) -=
+            0.5 * (c[static_cast<size_t>(row)] / c.back())
+            * (scl_row / scl_last);
     }
 
-    double lc = balanced[static_cast<size_t>(M)];
-    int n = M;
-    std::vector<double> A(static_cast<size_t>(n * n), 0.0);
-
-    for (int i = 0; i < n; ++i) {
-        A[static_cast<size_t>(i + (n - 1) * n)] = -balanced[static_cast<size_t>(i)] / lc;
-        if (i + 1 < n) {
-            A[static_cast<size_t>((i + 1) + i * n)] = 1.0;
-        }
-    }
-
-    std::vector<double> wr(static_cast<size_t>(n));
-    std::vector<double> wi(static_cast<size_t>(n));
-
+    std::vector<double> wr(static_cast<size_t>(n), 0.0);
+    std::vector<double> wi(static_cast<size_t>(n), 0.0);
     double work_query = 0.0;
     int lwork = -1;
     int info = 0;
     int one = 1;
 
-    dgeev_("N", "N", &n, A.data(), &n,
-           wr.data(), wi.data(),
-           nullptr, &one, nullptr, &one,
+    dgeev_("N", "N", &n, matrix.data(), &n,
+           wr.data(), wi.data(), nullptr, &one, nullptr, &one,
            &work_query, &lwork, &info);
-
-    lwork = static_cast<int>(work_query);
-    std::vector<double> work(static_cast<size_t>(lwork));
-
-    dgeev_("N", "N", &n, A.data(), &n,
-           wr.data(), wi.data(),
-           nullptr, &one, nullptr, &one,
-           work.data(), &lwork, &info);
-
-    if (info != 0) {
-        std::cerr << "  exact_fs_full: dgeev failed, info=" << info << "\n";
+    if (info != 0 || !std::isfinite(work_query)) {
         return {};
     }
 
-    std::vector<cx> roots(static_cast<size_t>(n));
+    lwork = std::max(4 * n, static_cast<int>(work_query));
+    std::vector<double> work(static_cast<size_t>(lwork), 0.0);
+    dgeev_("N", "N", &n, matrix.data(), &n,
+           wr.data(), wi.data(), nullptr, &one, nullptr, &one,
+           work.data(), &lwork, &info);
+    if (info != 0) {
+        return {};
+    }
+
+    std::vector<std::complex<double>> roots(static_cast<size_t>(n));
     for (int i = 0; i < n; ++i) {
-        roots[static_cast<size_t>(i)] =
-            cx(static_cast<long double>(wr[static_cast<size_t>(i)]),
-               static_cast<long double>(wi[static_cast<size_t>(i)]))
-            * static_cast<long double>(u_scale);
+        roots[static_cast<size_t>(i)] = {wr[static_cast<size_t>(i)],
+                                         wi[static_cast<size_t>(i)]};
+        if (!std::isfinite(wr[static_cast<size_t>(i)])
+            || !std::isfinite(wi[static_cast<size_t>(i)])) {
+            return {};
+        }
     }
     return roots;
 }
 
-std::pair<std::complex<long double>, std::complex<long double>>
-eval_poly_and_derivative_q128(const std::vector<quad>& coeffs,
-                              std::complex<long double> z)
-{
-    std::complex<long double> p = 0.0L;
-    std::complex<long double> dp = 0.0L;
+struct EvalResult {
+    mp_complex value;
+    mp_complex derivative;
+    mp_real absolute_sum;
+};
 
-    for (size_t i = coeffs.size(); i-- > 0;) {
-        dp = dp * z + p;
-        p = p * z + static_cast<long double>(coeffs[i]);
+EvalResult evaluate_chebyshev_with_derivative(
+    const std::vector<mp_real>& c,
+    const mp_complex& z)
+{
+    EvalResult result{mp_complex(c[0]), mp_complex(0), abs(c[0])};
+    if (c.size() == 1) {
+        return result;
     }
 
-    return {p, dp};
+    mp_complex T_prev2 = 1;
+    mp_complex T_prev1 = z;
+    mp_complex d_prev2 = 0;
+    mp_complex d_prev1 = 1;
+    result.value += c[1] * T_prev1;
+    result.derivative += c[1];
+    result.absolute_sum += abs(c[1] * T_prev1);
+
+    for (size_t k = 2; k < c.size(); ++k) {
+        const mp_complex T = 2 * z * T_prev1 - T_prev2;
+        const mp_complex dT = 2 * T_prev1 + 2 * z * d_prev1 - d_prev2;
+        result.value += c[k] * T;
+        result.derivative += c[k] * dT;
+        result.absolute_sum += abs(c[k] * T);
+        T_prev2 = T_prev1;
+        T_prev1 = T;
+        d_prev2 = d_prev1;
+        d_prev1 = dT;
+    }
+    return result;
 }
 
-void polish_u_roots_q128(const std::vector<quad>& coeffs_q,
-                         std::vector<cx>& roots)
+struct RootSolveResult {
+    std::vector<mp_complex> roots;
+    unsigned iterations = 0;
+    mp_real max_backward_error = 1;
+    bool converged = false;
+};
+
+RootSolveResult solve_chebyshev_roots(const std::vector<mp_real>& input_c)
 {
-    if (coeffs_q.size() < 2 || roots.empty()) {
-        return;
+    RootSolveResult result;
+    if (input_c.size() <= 1) {
+        result.converged = true;
+        result.max_backward_error = 0;
+        return result;
     }
 
-    for (cx& root : roots) {
-        std::complex<long double> z(
-            static_cast<long double>(root.real()),
-            static_cast<long double>(root.imag()));
-
-        for (int iter = 0; iter < 12; ++iter) {
-            const auto [p, dp] = eval_poly_and_derivative_q128(coeffs_q, z);
-            const long double dp_norm = std::abs(dp);
-            if (!(dp_norm > 1e-24L)) {
-                break;
-            }
-
-            std::complex<long double> step = p / dp;
-            const long double step_abs = std::abs(step);
-            const long double z_scale = 1.0L + std::abs(z);
-            if (step_abs > 0.5L * z_scale) {
-                step *= (0.5L * z_scale / step_abs);
-            }
-
-            z -= step;
-            if (step_abs < 1e-22L * z_scale) {
-                break;
-            }
-        }
-
-        long double re = z.real();
-        long double im = z.imag();
-        if (std::abs(im) < 1e-18L * (1.0L + std::abs(re))) {
-            im = 0.0L;
-        }
-        root = cx(re, im);
-    }
-}
-
-unsigned reduce_residual_u_roots(CascadeDecomposition& dec,
-                                 double div_tol,
-                                 double global_tol,
-                                 unsigned max_accept)
-{
-    if (dec.remainder.size() <= 1) {
-        return 0;
+    std::vector<mp_real> c = input_c;
+    const mp_real scale = std::max(mp_real("1e-90"), max_abs(c));
+    for (mp_real& value : c) {
+        value /= scale;
     }
 
-    const int deg = static_cast<int>(dec.remainder.size()) - 1;
-    if (deg <= 0 || (deg % 2) != 0) {
-        return 0;
+    const std::vector<std::complex<double>> seeds = chebyshev_colleague_seeds(c);
+    const size_t degree = c.size() - 1;
+    result.roots.resize(degree);
+
+    if (seeds.size() == degree) {
+        for (size_t i = 0; i < degree; ++i) {
+            result.roots[i] = mp_complex(seeds[i].real(), seeds[i].imag());
+        }
+    } else {
+        // Deterministic fallback.  The colleague path is normally used; this
+        // circle only keeps failure explicit instead of returning no roots.
+        const mp_real radius = 2;
+        for (size_t i = 0; i < degree; ++i) {
+            const mp_real angle =
+                2 * mp_pi() * (mp_real(i) + mp_real("0.5")) / degree;
+            result.roots[i] = mp_complex(radius * cos(angle), radius * sin(angle));
+        }
     }
 
-    const std::vector<quad> Q_q = real_to_q128(dec.remainder);
-    const std::vector<quad> F_q = q128_palindrome_to_u_poly(Q_q);
-    if (F_q.size() <= 1) {
-        return 0;
-    }
+    static const mp_real step_tolerance("1e-120");
+    static const mp_real residual_tolerance("1e-120");
+    static const mp_real tiny("1e-180");
+    mp_real previous_max_step = std::numeric_limits<mp_real>::max();
 
-    static constexpr double REAL_TOL = 1e-8;
-    static constexpr double PAIR_TOL = 1e-6;
+    for (unsigned iteration = 0; iteration < 800; ++iteration) {
+        const std::vector<mp_complex> old = result.roots;
+        mp_real max_relative_step = 0;
 
-    struct Candidate {
-        enum Type { BQ, QT } type;
-        double gamma = 0.0;
-        double alpha = 0.0;
-        double beta = 0.0;
-        double quality = std::numeric_limits<double>::infinity();
-        std::vector<quad> factor_u;
-        std::vector<quad> factor_z;
-    };
-
-    struct AcceptedFactor {
-        Candidate::Type type;
-        double gamma = 0.0;
-        double alpha = 0.0;
-        double beta = 0.0;
-        std::vector<quad> factor_z;
-    };
-
-    const std::vector<quad> Q_base = Q_q;
-    std::vector<AcceptedFactor> accepted_factors;
-    std::vector<quad> Q_work = Q_base;
-    std::vector<quad> F_work = F_q;
-    std::vector<Biquad> numerical_bq;
-    std::vector<Quartic> numerical_qt;
-
-    unsigned accepted = 0;
-
-    auto refresh_from_base = [&](std::vector<quad>& Q_next,
-                                 std::vector<quad>& F_next) -> bool
-    {
-        std::vector<quad> cur = Q_base;
-        for (const auto& f : accepted_factors) {
-            auto [q_trial, rem_trial] = q128_poly_divide(cur, f.factor_z);
-            const double rel_Q = static_cast<double>(
-                max_abs_value_q128(rem_trial)
-                / std::max(1e-30Q, max_abs_value_q128(cur)));
-            if (rel_Q > div_tol * 10.0) {
-                return false;
-            }
-            enforce_palindromic_symmetry_q128(q_trial);
-            cur = std::move(q_trial);
-        }
-
-        if (cur.size() <= 1) {
-            Q_next = std::move(cur);
-            F_next = {1.0Q};
-            return true;
-        }
-
-        const int cur_deg = static_cast<int>(cur.size()) - 1;
-        if ((cur_deg % 2) != 0) {
-            return false;
-        }
-
-        Q_next = cur;
-        F_next = q128_palindrome_to_u_poly(Q_next);
-        return !F_next.empty();
-    };
-
-    auto cumulative_rebuild_error = [&](const std::vector<quad>& quotient) {
-        std::vector<quad> rebuilt = quotient;
-        for (const auto& f : accepted_factors) {
-            rebuilt = q128_poly_multiply(rebuilt, f.factor_z);
-        }
-
-        const size_t len = std::max(Q_base.size(), rebuilt.size());
-        quad max_abs = 0.0Q;
-        quad max_ref = 1e-30Q;
-        for (size_t i = 0; i < len; ++i) {
-            const quad ref = (i < Q_base.size()) ? Q_base[i] : 0.0Q;
-            const quad cur = (i < rebuilt.size()) ? rebuilt[i] : 0.0Q;
-            max_abs = std::max(max_abs, fabsq(ref - cur));
-            max_ref = std::max(max_ref, fabsq(ref));
-        }
-        return static_cast<double>(max_abs / max_ref);
-    };
-
-    while (F_work.size() > 1) {
-        if (max_accept > 0 && accepted >= max_accept) {
-            break;
-        }
-
-        std::vector<double> Fd(F_work.size(), 0.0);
-        for (size_t i = 0; i < F_work.size(); ++i) {
-            Fd[i] = static_cast<double>(F_work[i]);
-        }
-
-        std::vector<cx> u_roots = companion_eigenvalues(Fd);
-        if (u_roots.empty()) {
-            break;
-        }
-        polish_u_roots_q128(F_work, u_roots);
-
-        std::vector<Candidate> candidates;
-        std::vector<bool> used(u_roots.size(), false);
-
-        for (size_t i = 0; i < u_roots.size(); ++i) {
-            if (std::abs(u_roots[i].imag()) < REAL_TOL) {
-                const long double gamma_ld = u_roots[i].real();
-                Candidate c;
-                c.type = Candidate::BQ;
-                c.gamma = static_cast<double>(gamma_ld);
-                c.quality = static_cast<double>(std::abs(u_roots[i].imag()));
-                c.factor_u = {-static_cast<quad>(gamma_ld), 1.0Q};
-                c.factor_z = {1.0Q, -static_cast<quad>(gamma_ld), 1.0Q};
-                candidates.push_back(c);
-                used[i] = true;
-            }
-        }
-
-        for (size_t i = 0; i < u_roots.size(); ++i) {
-            if (used[i] || std::abs(u_roots[i].imag()) < REAL_TOL) {
+        for (size_t i = 0; i < degree; ++i) {
+            const EvalResult eval = evaluate_chebyshev_with_derivative(c, old[i]);
+            if (abs(eval.derivative) < tiny) {
                 continue;
             }
 
-            size_t best_j = u_roots.size();
-            double best_dist = std::numeric_limits<double>::infinity();
-            for (size_t j = i + 1; j < u_roots.size(); ++j) {
-                if (used[j] || std::abs(u_roots[j].imag()) < REAL_TOL) {
+            const mp_complex newton = eval.value / eval.derivative;
+            mp_complex repulsion = 0;
+            for (size_t j = 0; j < degree; ++j) {
+                if (i == j) {
                     continue;
                 }
-                if (u_roots[i].imag() * u_roots[j].imag() > 0.0) {
-                    continue;
-                }
-                const double dist = std::abs(u_roots[j] - std::conj(u_roots[i]));
-                if (dist < best_dist) {
-                    best_dist = dist;
-                    best_j = j;
+                const mp_complex difference = old[i] - old[j];
+                if (abs(difference) > tiny) {
+                    repulsion += 1 / difference;
                 }
             }
 
-            const double pair_tol = PAIR_TOL * (1.0 + std::abs(u_roots[i]));
-            if (best_j < u_roots.size() && best_dist < pair_tol) {
-                const long double re_u =
-                    0.5L * (u_roots[i].real() + u_roots[best_j].real());
-                const long double im_u =
-                    0.5L * std::abs(u_roots[i].imag() - u_roots[best_j].imag());
-                const long double alpha_ld = 2.0L * re_u;
-                const long double beta_ld = 2.0L + re_u * re_u + im_u * im_u;
-                Candidate c;
-                c.type = Candidate::QT;
-                c.alpha = static_cast<double>(alpha_ld);
-                c.beta = static_cast<double>(beta_ld);
-                c.quality = static_cast<double>(best_dist);
-                c.factor_u = {
-                    static_cast<quad>(beta_ld - 2.0L),
-                    -static_cast<quad>(alpha_ld),
-                    1.0Q
-                };
-                c.factor_z = {
-                    1.0Q,
-                    -static_cast<quad>(alpha_ld),
-                    static_cast<quad>(beta_ld),
-                    -static_cast<quad>(alpha_ld),
-                    1.0Q
-                };
-                candidates.push_back(c);
-                used[i] = true;
-                used[best_j] = true;
+            mp_complex denominator = 1 - newton * repulsion;
+            if (abs(denominator) < tiny) {
+                denominator = 1;
             }
+            mp_complex step = newton / denominator;
+
+            const mp_real root_scale = 1 + abs(old[i]);
+            const mp_real step_abs = abs(step);
+            if (step_abs > root_scale / 2) {
+                step *= (root_scale / 2) / step_abs;
+            }
+
+            result.roots[i] = old[i] - step;
+            max_relative_step = std::max(
+                max_relative_step, abs(step) / root_scale);
         }
 
-        std::sort(candidates.begin(), candidates.end(),
-                  [](const Candidate& a, const Candidate& b) {
-                      return a.quality < b.quality;
-                  });
+        result.iterations = iteration + 1;
 
-        if (candidates.empty()) {
+        mp_real max_backward = 0;
+        for (const mp_complex& root : result.roots) {
+            const EvalResult eval = evaluate_chebyshev_with_derivative(c, root);
+            const mp_real denominator = std::max(tiny, eval.absolute_sum);
+            max_backward = std::max(max_backward, abs(eval.value) / denominator);
+        }
+        result.max_backward_error = max_backward;
+
+        if (max_relative_step < step_tolerance
+            && max_backward < residual_tolerance) {
+            result.converged = true;
             break;
         }
 
-        size_t best_idx = candidates.size();
-        double best_score = std::numeric_limits<double>::infinity();
-        std::vector<quad> best_Q_next;
-        std::vector<quad> best_F_next;
-        Candidate best_cand;
-
-        for (size_t ci = 0; ci < candidates.size(); ++ci) {
-            const Candidate& cand = candidates[ci];
-            if (cand.factor_u.size() > F_work.size() || cand.factor_z.size() > Q_work.size()) {
-                continue;
-            }
-
-            auto [F_trial, F_rem] = q128_poly_divide(F_work, cand.factor_u);
-            auto [Q_trial, Q_rem] = q128_poly_divide(Q_work, cand.factor_z);
-
-            const double rel_F = static_cast<double>(
-                max_abs_value_q128(F_rem) / std::max(1e-30Q, max_abs_value_q128(F_work)));
-            const double rel_Q = static_cast<double>(
-                max_abs_value_q128(Q_rem) / std::max(1e-30Q, max_abs_value_q128(Q_work)));
-
-            double sym_err = 0.0;
-            for (size_t i = 0; i < Q_trial.size() / 2; ++i) {
-                sym_err = std::max(sym_err, static_cast<double>(
-                    fabsq(Q_trial[i] - Q_trial[Q_trial.size() - 1 - i])));
-            }
-
-            enforce_palindromic_symmetry_q128(Q_trial);
-            const double global_err = (cand.type == Candidate::BQ)
-                ? q128_relative_rebuild_error(Q_work, Q_trial, static_cast<quad>(cand.gamma))
-                : q128_relative_rebuild_error_multi(
-                    Q_work, Q_trial,
-                    {static_cast<quad>(cand.alpha), static_cast<quad>(cand.beta)},
-                    0u);
-
-            double score = std::max({rel_F, rel_Q, sym_err, global_err});
-            if (cand.type == Candidate::QT) {
-                const std::vector<quad> rebuilt = q128_poly_multiply(
-                    Q_trial,
-                    cand.factor_z);
-                quad max_abs = 0.0Q;
-                quad max_ref = 1e-30Q;
-                for (size_t i = 0; i < std::max(Q_work.size(), rebuilt.size()); ++i) {
-                    const quad ref = (i < Q_work.size()) ? Q_work[i] : 0.0Q;
-                    const quad cur = (i < rebuilt.size()) ? rebuilt[i] : 0.0Q;
-                    max_abs = std::max(max_abs, fabsq(ref - cur));
-                    max_ref = std::max(max_ref, fabsq(ref));
-                }
-                score = std::max(score, static_cast<double>(max_abs / max_ref));
-            }
-
-            if (rel_F <= div_tol && rel_Q <= div_tol && score < best_score) {
-                best_score = score;
-                best_idx = ci;
-                best_Q_next = std::move(Q_trial);
-                best_F_next = std::move(F_trial);
-                best_cand = cand;
-            }
-        }
-
-        if (best_idx == candidates.size() || best_score > global_tol) {
+        // A very small backward error is sufficient even for a clustered root
+        // whose forward step is limited by conditioning.
+        if (max_backward < mp_real("1e-140")
+            && max_relative_step >= previous_max_step
+            && iteration > 20) {
+            result.converged = true;
             break;
         }
+        previous_max_step = max_relative_step;
+    }
+    return result;
+}
 
-        if (best_cand.type == Candidate::BQ) {
-            numerical_bq.push_back(Biquad{best_cand.gamma, 0u});
+std::complex<double> section_value(const CascadeDecomposition& dec,
+                                   const CascadeSectionPlacement& placement,
+                                   double omega)
+{
+    const std::complex<double> x = std::polar(1.0, -omega);
+    switch (placement.kind) {
+    case CascadeSectionKind::FirstOrder: {
+        const auto& section = dec.first_order[placement.index];
+        return 1.0 + static_cast<double>(section.sign) * x;
+    }
+    case CascadeSectionKind::Biquad: {
+        const auto& section = dec.biquads[placement.index];
+        return 1.0 - section.gamma * x + x * x;
+    }
+    case CascadeSectionKind::Quartic: {
+        const auto& section = dec.quartics[placement.index];
+        const std::complex<double> x2 = x * x;
+        return 1.0 - section.alpha * x + section.beta * x2
+             - section.alpha * x2 * x + x2 * x2;
+    }
+    case CascadeSectionKind::Block: {
+        const auto& block = dec.blocks[placement.index].coefficients;
+        std::complex<double> value = 0.0;
+        for (size_t i = block.size(); i-- > 0;) {
+            value = value * x + block[i];
+        }
+        return value;
+    }
+    }
+    return 1.0;
+}
+
+double section_dc_value(const CascadeDecomposition& dec,
+                        const CascadeSectionPlacement& placement)
+{
+    switch (placement.kind) {
+    case CascadeSectionKind::FirstOrder:
+        return 1.0 + dec.first_order[placement.index].sign;
+    case CascadeSectionKind::Biquad:
+        return 2.0 - dec.biquads[placement.index].gamma;
+    case CascadeSectionKind::Quartic: {
+        const auto& section = dec.quartics[placement.index];
+        return 2.0 - 2.0 * section.alpha + section.beta;
+    }
+    case CascadeSectionKind::Block:
+        return std::accumulate(
+            dec.blocks[placement.index].coefficients.begin(),
+            dec.blocks[placement.index].coefficients.end(), 0.0);
+    }
+    return 1.0;
+}
+
+void build_balanced_execution_order(CascadeDecomposition& dec,
+                                    const DirectFIR& fir)
+{
+    std::vector<CascadeSectionPlacement> candidates;
+    candidates.reserve(dec.first_order.size() + dec.biquads.size()
+                       + dec.quartics.size());
+    for (size_t i = 0; i < dec.first_order.size(); ++i) {
+        candidates.push_back({CascadeSectionKind::FirstOrder, i, 1.0});
+    }
+    for (size_t i = 0; i < dec.biquads.size(); ++i) {
+        candidates.push_back({CascadeSectionKind::Biquad, i, 1.0});
+    }
+    for (size_t i = 0; i < dec.quartics.size(); ++i) {
+        candidates.push_back({CascadeSectionKind::Quartic, i, 1.0});
+    }
+    for (size_t i = 0; i < dec.blocks.size(); ++i) {
+        candidates.push_back({CascadeSectionKind::Block, i, 1.0});
+    }
+
+    // The public designer currently produces low-pass filters with nonzero
+    // DC gain.  Normalising every section to unity at DC prevents the huge
+    // final compensation factor used by the old L1 scheme.
+    for (auto& placement : candidates) {
+        const double dc = section_dc_value(dec, placement);
+        if (std::isfinite(dc) && std::abs(dc) > 1e-18) {
+            placement.scale = 1.0 / dc;
         } else {
-            numerical_qt.push_back(Quartic{best_cand.alpha, best_cand.beta});
+            placement.scale = 1.0;
         }
+    }
 
-        accepted_factors.push_back(AcceptedFactor{
-            best_cand.type,
-            best_cand.gamma,
-            best_cand.alpha,
-            best_cand.beta,
-            best_cand.factor_z
-        });
+    static constexpr size_t GRID_SIZE = 65;
+    const double pass_edge = std::clamp(
+        2.0 * PI * fir.spec.f_pass / fir.spec.fs, 0.0, PI);
+    std::vector<std::vector<double>> logs(
+        candidates.size(), std::vector<double>(GRID_SIZE, 0.0));
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        for (size_t g = 0; g < GRID_SIZE; ++g) {
+            const double omega = pass_edge * static_cast<double>(g)
+                               / static_cast<double>(GRID_SIZE - 1);
+            const double magnitude = std::abs(
+                candidates[i].scale * section_value(dec, candidates[i], omega));
+            logs[i][g] = std::log(std::max(1e-300, magnitude));
+        }
+    }
 
-        if (!refresh_from_base(best_Q_next, best_F_next)) {
-            if (best_cand.type == Candidate::BQ) {
-                numerical_bq.pop_back();
-            } else {
-                numerical_qt.pop_back();
+    std::vector<bool> used(candidates.size(), false);
+    std::vector<double> cumulative(GRID_SIZE, 0.0);
+    dec.execution_order.clear();
+    dec.execution_order.reserve(candidates.size());
+
+    for (size_t position = 0; position < candidates.size(); ++position) {
+        size_t best = candidates.size();
+        double best_score = std::numeric_limits<double>::infinity();
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            if (used[i]) {
+                continue;
             }
-            accepted_factors.pop_back();
-            break;
-        }
-
-        const double cumulative_err = cumulative_rebuild_error(best_Q_next);
-        if (cumulative_err > global_tol) {
-            if (best_cand.type == Candidate::BQ) {
-                numerical_bq.pop_back();
-            } else {
-                numerical_qt.pop_back();
+            double score = 0.0;
+            for (size_t g = 0; g < GRID_SIZE; ++g) {
+                score = std::max(score, std::abs(cumulative[g] + logs[i][g]));
             }
-            accepted_factors.pop_back();
-            break;
+            if (score < best_score) {
+                best_score = score;
+                best = i;
+            }
         }
 
-        Q_work = std::move(best_Q_next);
-        F_work = std::move(best_F_next);
-        ++accepted;
+        used[best] = true;
+        dec.execution_order.push_back(candidates[best]);
+        for (size_t g = 0; g < GRID_SIZE; ++g) {
+            cumulative[g] += logs[best][g];
+        }
     }
 
-    for (const auto& bq : numerical_bq) {
-        dec.biquads.push_back(bq);
+    if (fir.frequency_samples.size() == fir.length()) {
+        dec.runtime_gain = fir.frequency_samples[0];
+    } else {
+        dec.runtime_gain = std::accumulate(fir.h.begin(), fir.h.end(), 0.0);
     }
-    for (const auto& qt : numerical_qt) {
-        dec.quartics.push_back(qt);
-    }
-
-    dec.remainder = q128_to_real(Q_work);
-    return accepted;
 }
 
-double compute_rebuild_max_err(const CascadeDecomposition& dec,
-                               const std::vector<real_t>& h_orig,
-                               unsigned original_length)
+std::vector<mp_real> placement_factor_mp(
+    const CascadeDecomposition& dec,
+    const CascadeSectionPlacement& placement)
 {
-    const std::vector<real_t> rebuilt = recompose(dec, original_length);
-    double max_err = 0.0;
-    for (size_t i = 0; i < h_orig.size(); ++i) {
-        const double v = (i < rebuilt.size()) ? rebuilt[i] : 0.0;
-        const double err = std::abs(h_orig[i] - v);
-        if (err > max_err) {
-            max_err = err;
-        }
+    switch (placement.kind) {
+    case CascadeSectionKind::FirstOrder: {
+        const auto& section = dec.first_order[placement.index];
+        return {mp_real(1), mp_real(section.sign)};
     }
-    return max_err;
+    case CascadeSectionKind::Biquad: {
+        const auto& section = dec.biquads[placement.index];
+        return {mp_real(1), -mp_real(section.gamma), mp_real(1)};
+    }
+    case CascadeSectionKind::Quartic: {
+        const auto& section = dec.quartics[placement.index];
+        return {mp_real(1), -mp_real(section.alpha), mp_real(section.beta),
+                -mp_real(section.alpha), mp_real(1)};
+    }
+    case CascadeSectionKind::Block: {
+        std::vector<mp_real> factor;
+        for (double coefficient : dec.blocks[placement.index].coefficients) {
+            factor.emplace_back(coefficient);
+        }
+        return factor;
+    }
+    }
+    return {mp_real(1)};
 }
 
-double exact_return_err_limit(double err_stage1)
+CascadeDecomposition recombine_into_blocks(
+    const CascadeDecomposition& source,
+    const DirectFIR& fir,
+    const std::vector<std::vector<mp_real>>& ordered_precise_factors,
+    unsigned max_block_order)
 {
-    return std::max(1e-6, 10.0 * err_stage1);
+    CascadeDecomposition result = source;
+    result.first_order.clear();
+    result.biquads.clear();
+    result.quartics.clear();
+    result.blocks.clear();
+    result.execution_order.clear();
+
+    static constexpr size_t GRID_SIZE = 65;
+    const double pass_edge = std::clamp(
+        2.0 * PI * fir.spec.f_pass / fir.spec.fs, 0.0, PI);
+    std::vector<std::vector<double>> factor_logs(
+        ordered_precise_factors.size(), std::vector<double>(GRID_SIZE, 0.0));
+    std::vector<unsigned> factor_orders(ordered_precise_factors.size(), 0u);
+
+    for (size_t i = 0; i < ordered_precise_factors.size(); ++i) {
+        const auto& factor = ordered_precise_factors[i];
+        factor_orders[i] = factor.empty()
+            ? 0u : static_cast<unsigned>(factor.size() - 1);
+        mp_real dc_mp = 0;
+        for (const mp_real& coefficient : factor) {
+            dc_mp += coefficient;
+        }
+        const double dc = static_cast<double>(dc_mp);
+        const double normalizer = (std::isfinite(dc) && std::abs(dc) > 1e-300)
+            ? 1.0 / dc : 1.0;
+        for (size_t g = 0; g < GRID_SIZE; ++g) {
+            const double omega = pass_edge * static_cast<double>(g)
+                               / static_cast<double>(GRID_SIZE - 1);
+            const std::complex<double> x = std::polar(1.0, -omega);
+            std::complex<double> value = 0.0;
+            for (size_t k = factor.size(); k-- > 0;) {
+                value = value * x + static_cast<double>(factor[k]);
+            }
+            factor_logs[i][g] = std::log(std::max(
+                1e-300, std::abs(normalizer * value)));
+        }
+    }
+
+    // Form every block independently.  Resetting the cumulative response at
+    // a block boundary pairs attenuating and amplifying factors inside the
+    // same rounded polynomial instead of leaving a catastrophic cancellation
+    // between two different double-precision blocks.
+    std::vector<bool> factor_used(ordered_precise_factors.size(), false);
+    size_t factors_left = ordered_precise_factors.size();
+    while (factors_left > 0) {
+        std::vector<mp_real> block_mp = {mp_real(1)};
+        std::vector<double> block_log(GRID_SIZE, 0.0);
+        unsigned block_order = 0;
+
+        while (true) {
+            size_t best = ordered_precise_factors.size();
+            double best_score = std::numeric_limits<double>::infinity();
+            for (size_t i = 0; i < ordered_precise_factors.size(); ++i) {
+                if (factor_used[i]
+                    || block_order + factor_orders[i] > max_block_order) {
+                    continue;
+                }
+                double score = 0.0;
+                for (size_t g = 0; g < GRID_SIZE; ++g) {
+                    score = std::max(
+                        score, std::abs(block_log[g] + factor_logs[i][g]));
+                }
+                if (score < best_score) {
+                    best_score = score;
+                    best = i;
+                }
+            }
+
+            if (best == ordered_precise_factors.size()) {
+                break;
+            }
+            factor_used[best] = true;
+            --factors_left;
+            block_mp = poly_multiply_t(
+                block_mp, ordered_precise_factors[best]);
+            block_order += factor_orders[best];
+            for (size_t g = 0; g < GRID_SIZE; ++g) {
+                block_log[g] += factor_logs[best][g];
+            }
+        }
+
+        CascadeBlock block;
+        block.coefficients.reserve(block_mp.size());
+        for (const mp_real& coefficient : block_mp) {
+            block.coefficients.push_back(static_cast<double>(coefficient));
+        }
+        result.blocks.push_back(std::move(block));
+    }
+
+    // Distribute the mathematical gain across all blocks in the logarithmic
+    // domain. Every scaled block receives the same L1 norm, so no single
+    // section has to carry a huge compensation factor.
+    std::vector<CascadeSectionPlacement> placements;
+    std::vector<double> log_l1(result.blocks.size(), 0.0);
+    double log_l1_sum = 0.0;
+    for (size_t i = 0; i < result.blocks.size(); ++i) {
+        double l1 = 0.0;
+        for (double coefficient : result.blocks[i].coefficients) {
+            l1 += std::abs(coefficient);
+        }
+        l1 = std::max(l1, 1e-300);
+        log_l1[i] = std::log(l1);
+        log_l1_sum += log_l1[i];
+    }
+
+    const double abs_gain = std::max(1e-300, std::abs(result.gain));
+    const double common_log_l1 = result.blocks.empty()
+        ? 0.0
+        : (std::log(abs_gain) + log_l1_sum)
+          / static_cast<double>(result.blocks.size());
+
+    // Order the balanced blocks on the whole Nyquist interval. In the
+    // passband the cumulative response is kept close to unity; outside it
+    // attenuation is harmless and only positive growth is penalised.
+    static constexpr size_t BLOCK_GRID_SIZE = 129;
+    std::vector<std::vector<double>> block_logs(
+        result.blocks.size(), std::vector<double>(BLOCK_GRID_SIZE, 0.0));
+    for (size_t i = 0; i < result.blocks.size(); ++i) {
+        const double scale = std::exp(common_log_l1 - log_l1[i]);
+        placements.push_back({CascadeSectionKind::Block, i, scale});
+        for (size_t g = 0; g < BLOCK_GRID_SIZE; ++g) {
+            const double omega = PI * static_cast<double>(g)
+                               / static_cast<double>(BLOCK_GRID_SIZE - 1);
+            block_logs[i][g] = std::log(std::max(
+                1e-300, std::abs(scale * section_value(
+                    result, placements.back(), omega))));
+        }
+    }
+
+    std::vector<bool> block_used(result.blocks.size(), false);
+    std::vector<double> cumulative(BLOCK_GRID_SIZE, 0.0);
+    for (size_t position = 0; position < result.blocks.size(); ++position) {
+        size_t best = result.blocks.size();
+        double best_score = std::numeric_limits<double>::infinity();
+        for (size_t i = 0; i < result.blocks.size(); ++i) {
+            if (block_used[i]) {
+                continue;
+            }
+            double score = 0.0;
+            for (size_t g = 0; g < BLOCK_GRID_SIZE; ++g) {
+                const double omega = PI * static_cast<double>(g)
+                                   / static_cast<double>(BLOCK_GRID_SIZE - 1);
+                const double next = cumulative[g] + block_logs[i][g];
+                const double local_score = (omega <= pass_edge)
+                    ? std::abs(next) : std::max(0.0, next);
+                score = std::max(score, local_score);
+            }
+            if (score < best_score) {
+                best_score = score;
+                best = i;
+            }
+        }
+        block_used[best] = true;
+        result.execution_order.push_back(placements[best]);
+        for (size_t g = 0; g < BLOCK_GRID_SIZE; ++g) {
+            cumulative[g] += block_logs[best][g];
+        }
+    }
+
+    result.runtime_gain = (result.gain < 0.0) ? -1.0 : 1.0;
+    return result;
+}
+
+double cascade_impulse_error(const CascadeDecomposition& dec,
+                             const DirectFIR& fir,
+                             long double* peak_internal = nullptr)
+{
+    std::vector<double> impulse(fir.length() * 2u, 0.0);
+    impulse[0] = 1.0;
+    CascadeFilterState state;
+    state.init(dec);
+    double max_error = 0.0;
+    for (size_t i = 0; i < impulse.size(); ++i) {
+        const double output = state.push_double(impulse[i]);
+        if (!std::isfinite(output)) {
+            if (peak_internal != nullptr) {
+                *peak_internal = state.peak_internal;
+            }
+            return std::numeric_limits<double>::infinity();
+        }
+        const double reference = (i < fir.h.size()) ? fir.h[i] : 0.0;
+        max_error = std::max(max_error, std::abs(output - reference));
+    }
+    if (peak_internal != nullptr) {
+        *peak_internal = state.peak_internal;
+    }
+    return max_error;
+}
+
+unsigned maximum_block_order(const CascadeDecomposition& dec)
+{
+    unsigned result = 0;
+    for (const CascadeBlock& block : dec.blocks) {
+        if (!block.coefficients.empty()) {
+            result = std::max(
+                result,
+                static_cast<unsigned>(block.coefficients.size() - 1));
+        }
+    }
+    return result;
+}
+
+CascadeDecomposition direct_form_fallback(
+    const DirectFIR& fir,
+    CascadeDiagnostics diagnostics)
+{
+    CascadeDecomposition result;
+    result.remainder = {1.0};
+    result.gain = 1.0;
+    result.runtime_gain = 1.0;
+    result.diagnostics = diagnostics;
+
+    if (fir.h.empty()) {
+        result.diagnostics.status = CascadeBuildStatus::Failed;
+        result.diagnostics.runtime_verified = false;
+        return result;
+    }
+
+    result.blocks.push_back(CascadeBlock{fir.h});
+    result.execution_order.push_back(
+        {CascadeSectionKind::Block, 0, 1.0});
+    result.diagnostics.status = CascadeBuildStatus::DirectFormFallback;
+    result.diagnostics.selected_max_block_order = fir.order();
+    long double peak_internal = 0.0L;
+    result.diagnostics.runtime_impulse_error =
+        cascade_impulse_error(result, fir, &peak_internal);
+    result.diagnostics.runtime_peak_internal =
+        static_cast<double>(peak_internal);
+    result.diagnostics.runtime_verified =
+        std::isfinite(result.diagnostics.runtime_impulse_error);
+    return result;
+}
+
+double block_coefficient_error_mp(const CascadeDecomposition& dec,
+                                  const DirectFIR& fir)
+{
+    std::vector<std::vector<mp_real>> factors;
+    factors.reserve(dec.blocks.size());
+    for (const CascadeBlock& block : dec.blocks) {
+        std::vector<mp_real> factor;
+        factor.reserve(block.coefficients.size());
+        for (double coefficient : block.coefficients) {
+            factor.emplace_back(coefficient);
+        }
+        factors.push_back(std::move(factor));
+    }
+    std::vector<mp_real> rebuilt = balanced_product(std::move(factors));
+    mp_real max_error = 0;
+    for (size_t i = 0; i < std::max(rebuilt.size(), fir.h.size()); ++i) {
+        const mp_real value = (i < rebuilt.size()) ? rebuilt[i] * dec.gain : 0;
+        const mp_real reference = (i < fir.h.size()) ? mp_real(fir.h[i]) : 0;
+        max_error = std::max(max_error, abs(value - reference));
+    }
+    return static_cast<double>(max_error);
+}
+
+CascadeDecomposition choose_stable_blocking(
+    const CascadeDecomposition& sections,
+    const DirectFIR& fir,
+    const std::vector<std::vector<mp_real>>& ordered_precise_factors)
+{
+    static const unsigned preferred_block_orders[] = {
+        4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512
+    };
+    std::vector<unsigned> block_orders;
+    for (unsigned order : preferred_block_orders) {
+        if (order < fir.order()) {
+            block_orders.push_back(order);
+        }
+    }
+    if (fir.order() > 0) {
+        block_orders.push_back(fir.order());
+    }
+
+    double reference_scale = 0.0;
+    for (double coefficient : fir.h) {
+        reference_scale = std::max(reference_scale, std::abs(coefficient));
+    }
+    const double tolerance = std::max(1e-11, reference_scale * 1e-8);
+
+    CascadeDecomposition best;
+    CascadeDecomposition high_precision_best;
+    bool has_high_precision_candidate = false;
+    double best_error = std::numeric_limits<double>::infinity();
+    unsigned best_order = 0;
+    for (unsigned order : block_orders) {
+        CascadeDecomposition candidate = recombine_into_blocks(
+            sections, fir, ordered_precise_factors, order);
+        long double peak_internal = 0.0L;
+        const double error = cascade_impulse_error(
+            candidate, fir, &peak_internal);
+        candidate.diagnostics.runtime_peak_internal =
+            static_cast<double>(peak_internal);
+        candidate.diagnostics.runtime_impulse_error = error;
+        candidate.diagnostics.runtime_verified =
+            std::isfinite(error) && error <= tolerance;
+        candidate.diagnostics.selected_max_block_order =
+            maximum_block_order(candidate);
+
+        // Prefer a native-precision short cascade whenever one exists. If
+        // only a full-order native block is viable, keep the first genuinely
+        // short factorization whose rounded coefficients are accurate and
+        // whose 50-decimal-digit runtime passes the same impulse criterion.
+        if (!has_high_precision_candidate
+            && error > tolerance
+            && order <= 32
+            && order < fir.order()) {
+            const double coefficient_error =
+                block_coefficient_error_mp(candidate, fir);
+            if (std::isfinite(coefficient_error)
+                && coefficient_error <= tolerance) {
+                candidate.diagnostics.runtime_decimal_digits = 50;
+                candidate.diagnostics.status =
+                    CascadeBuildStatus::HighPrecisionShortBlockCascade;
+                long double mp_peak = 0.0L;
+                const double mp_error = cascade_impulse_error(
+                    candidate, fir, &mp_peak);
+                if (std::isfinite(mp_error) && mp_error <= tolerance) {
+                    candidate.diagnostics.runtime_verified = true;
+                    candidate.diagnostics.runtime_impulse_error = mp_error;
+                    candidate.diagnostics.runtime_peak_internal =
+                        static_cast<double>(mp_peak);
+                    high_precision_best = candidate;
+                    has_high_precision_candidate = true;
+                } else {
+                    candidate.diagnostics.runtime_decimal_digits = 0;
+                    candidate.diagnostics.status =
+                        CascadeBuildStatus::Unspecified;
+                }
+            }
+        }
+        if (error < best_error) {
+            best = std::move(candidate);
+            best_error = error;
+            best_order = order;
+        }
+        if (error <= tolerance) {
+            CascadeDecomposition accepted = std::move(best);
+            if (accepted.diagnostics.selected_max_block_order >= fir.order()
+                && has_high_precision_candidate) {
+                std::cerr << "decompose_exact_fs_full: selected high-precision "
+                          << "short-block cascade (order <= "
+                          << high_precision_best.diagnostics.selected_max_block_order
+                          << ", impulse max error " << std::scientific
+                          << high_precision_best.diagnostics.runtime_impulse_error
+                          << ")" << std::defaultfloat << "\n";
+                return high_precision_best;
+            }
+            accepted.diagnostics.status =
+                (accepted.diagnostics.selected_max_block_order < fir.order())
+                ? CascadeBuildStatus::ShortBlockCascade
+                : CascadeBuildStatus::FullOrderFactorBlock;
+            std::cerr << "decompose_exact_fs_full: selected block order <= "
+                      << order << " (impulse max error " << std::scientific
+                      << error << ")" << std::defaultfloat << "\n";
+            return accepted;
+        }
+    }
+
+    std::cerr << "decompose_exact_fs_full: no block size met tolerance; "
+              << "using best order " << best_order << " with impulse max error "
+              << std::scientific << best_error << std::defaultfloat << "\n";
+    CascadeDiagnostics diagnostics = sections.diagnostics;
+    diagnostics.runtime_impulse_error = best_error;
+    diagnostics.selected_max_block_order = best_order;
+    if (has_high_precision_candidate) {
+        return high_precision_best;
+    }
+    return direct_form_fallback(fir, diagnostics);
+}
+
+CascadeDecomposition factor_reduced_residual(const DirectFIR& fir,
+                                              ComplementReduction reduction)
+{
+    CascadeDecomposition stage1 = reduction.decomposition;
+    if (!stage1.diagnostics.complement_verified) {
+        std::cerr << "decompose_exact_fs_full: complementary identity failed; "
+                     "using direct-form fallback\n";
+        return direct_form_fallback(fir, stage1.diagnostics);
+    }
+    const int residual_degree = static_cast<int>(reduction.residual.size()) - 1;
+    if (residual_degree <= 0) {
+        stage1.remainder = {1.0};
+        stage1.gain = static_cast<double>(reduction.impulse.front());
+        build_balanced_execution_order(stage1, fir);
+        stage1.diagnostics.roots_verified = true;
+        stage1.diagnostics.root_backward_error = 0.0;
+        stage1.diagnostics.root_rebuild_error = 0.0;
+        stage1.diagnostics.runtime_impulse_error =
+            cascade_impulse_error(stage1, fir);
+        stage1.diagnostics.runtime_verified =
+            std::isfinite(stage1.diagnostics.runtime_impulse_error)
+            && stage1.diagnostics.runtime_impulse_error <= 1e-11;
+        if (!stage1.diagnostics.runtime_verified) {
+            return direct_form_fallback(fir, stage1.diagnostics);
+        }
+        stage1.diagnostics.status = CascadeBuildStatus::ShortBlockCascade;
+        return stage1;
+    }
+    if ((residual_degree % 2) != 0) {
+        std::cerr << "decompose_exact_fs_full: odd residual degree "
+                  << residual_degree << "; using direct-form fallback\n";
+        return direct_form_fallback(fir, stage1.diagnostics);
+    }
+
+    const size_t M = static_cast<size_t>(residual_degree / 2);
+    std::vector<mp_real> chebyshev(M + 1, 0);
+    chebyshev[0] = reduction.residual[M];
+    for (size_t k = 1; k <= M; ++k) {
+        chebyshev[k] = 2 * reduction.residual[M - k];
+    }
+
+    RootSolveResult roots = solve_chebyshev_roots(chebyshev);
+    stage1.diagnostics.root_iterations = roots.iterations;
+    stage1.diagnostics.root_backward_error =
+        static_cast<double>(roots.max_backward_error);
+    if (!roots.converged || roots.roots.size() != M) {
+        std::cerr << "decompose_exact_fs_full: multiprecision root solve failed"
+                  << " (degree=" << M
+                  << ", iterations=" << roots.iterations
+                  << ", backward=" << std::scientific
+                  << static_cast<double>(roots.max_backward_error)
+                  << std::defaultfloat << "); using direct-form fallback\n";
+        return direct_form_fallback(fir, stage1.diagnostics);
+    }
+
+    std::cerr << "decompose_exact_fs_full: residual u-degree=" << M
+              << ", Aberth iterations=" << roots.iterations
+              << ", backward=" << std::scientific
+              << static_cast<double>(roots.max_backward_error)
+              << std::defaultfloat << "\n";
+
+    std::vector<bool> used(M, false);
+    std::vector<std::vector<mp_real>> residual_factors;
+    std::vector<std::vector<mp_real>> precise_biquads;
+    std::vector<std::vector<mp_real>> precise_quartics;
+    precise_biquads.reserve(stage1.biquads.size() + M);
+    for (const auto& biquad : stage1.biquads) {
+        const mp_real gamma = 2 * cos(
+            2 * mp_pi() * biquad.k_index / fir.length());
+        precise_biquads.push_back({mp_real(1), -gamma, mp_real(1)});
+    }
+    static const mp_real real_tolerance("1e-35");
+    // Highly clustered roots may have a tiny backward error while their
+    // forward conjugacy error is much larger.  Pairing is therefore followed
+    // by a full multiprecision coefficient rebuild, which is the authoritative
+    // acceptance test.
+    static const mp_real pair_tolerance("1e-12");
+    const unsigned numerical_k = std::numeric_limits<unsigned>::max();
+
+    for (size_t i = 0; i < M; ++i) {
+        if (used[i]) {
+            continue;
+        }
+
+        const mp_complex u = 2 * roots.roots[i];
+        if (abs(u.imag()) <= real_tolerance * (1 + abs(u.real()))) {
+            stage1.biquads.push_back(
+                Biquad{static_cast<double>(u.real()), numerical_k});
+            std::vector<mp_real> factor = {
+                mp_real(1), -u.real(), mp_real(1)
+            };
+            residual_factors.push_back(factor);
+            precise_biquads.push_back(std::move(factor));
+            used[i] = true;
+            continue;
+        }
+
+        size_t best = M;
+        mp_real best_distance = std::numeric_limits<mp_real>::max();
+        for (size_t j = 0; j < M; ++j) {
+            if (j == i || used[j]) {
+                continue;
+            }
+            const mp_real distance = abs(roots.roots[j] - conj(roots.roots[i]));
+            if (distance < best_distance) {
+                best_distance = distance;
+                best = j;
+            }
+        }
+
+        if (best == M
+            || best_distance > pair_tolerance * (1 + abs(roots.roots[i]))) {
+            std::cerr << "decompose_exact_fs_full: unmatched complex u-root"
+                      << " (nearest relative distance=" << std::scientific
+                      << static_cast<double>(best_distance / (1 + abs(roots.roots[i])))
+                      << std::defaultfloat << "); "
+                         "using direct-form fallback\n";
+            return direct_form_fallback(fir, stage1.diagnostics);
+        }
+
+        const mp_complex paired_u = 2 * conj(roots.roots[best]);
+        const mp_complex averaged_u = (u + paired_u) / 2;
+        const mp_real alpha = 2 * averaged_u.real();
+        const mp_real beta = 2 + norm(averaged_u);
+        stage1.quartics.push_back(
+            Quartic{static_cast<double>(alpha), static_cast<double>(beta)});
+        std::vector<mp_real> factor = {
+            mp_real(1), -alpha, beta, -alpha, mp_real(1)
+        };
+        residual_factors.push_back(factor);
+        precise_quartics.push_back(std::move(factor));
+        used[i] = true;
+        used[best] = true;
+    }
+
+    std::vector<mp_real> rebuilt_residual =
+        balanced_product(std::move(residual_factors));
+    for (mp_real& value : rebuilt_residual) {
+        value *= reduction.residual.front();
+    }
+    mp_real root_rebuild_error = 0;
+    if (rebuilt_residual.size() != reduction.residual.size()) {
+        root_rebuild_error = 1;
+    } else {
+        for (size_t i = 0; i < rebuilt_residual.size(); ++i) {
+            root_rebuild_error = std::max(
+                root_rebuild_error,
+                abs(rebuilt_residual[i] - reduction.residual[i]));
+        }
+        root_rebuild_error /= std::max(
+            mp_real("1e-90"), max_abs(reduction.residual));
+    }
+
+    std::cerr << "decompose_exact_fs_full: root-set rebuild="
+              << std::scientific << static_cast<double>(root_rebuild_error)
+              << std::defaultfloat << "\n";
+    stage1.diagnostics.root_rebuild_error =
+        static_cast<double>(root_rebuild_error);
+    stage1.diagnostics.roots_verified =
+        root_rebuild_error <= mp_real("1e-45");
+    if (root_rebuild_error > mp_real("1e-45")) {
+        std::cerr << "decompose_exact_fs_full: root set does not reconstruct "
+                     "the reduced polynomial; using direct-form fallback\n";
+        return direct_form_fallback(fir, stage1.diagnostics);
+    }
+
+    stage1.remainder = {1.0};
+    stage1.gain = static_cast<double>(reduction.impulse.front());
+    build_balanced_execution_order(stage1, fir);
+
+    std::vector<std::vector<mp_real>> ordered_precise_factors;
+    ordered_precise_factors.reserve(stage1.execution_order.size());
+    for (const auto& placement : stage1.execution_order) {
+        switch (placement.kind) {
+        case CascadeSectionKind::FirstOrder: {
+            const int sign = stage1.first_order[placement.index].sign;
+            ordered_precise_factors.push_back({mp_real(1), mp_real(sign)});
+            break;
+        }
+        case CascadeSectionKind::Biquad:
+            ordered_precise_factors.push_back(
+                precise_biquads[placement.index]);
+            break;
+        case CascadeSectionKind::Quartic:
+            ordered_precise_factors.push_back(
+                precise_quartics[placement.index]);
+            break;
+        case CascadeSectionKind::Block:
+            ordered_precise_factors.push_back(
+                placement_factor_mp(stage1, placement));
+            break;
+        }
+    }
+
+    std::cerr << "decompose_exact_fs_full: sections fo="
+              << stage1.first_order.size()
+              << ", bq=" << stage1.biquads.size()
+              << ", qt=" << stage1.quartics.size()
+              << ", gain=" << std::scientific << stage1.gain
+              << ", runtime_gain=" << stage1.runtime_gain
+              << std::defaultfloat << "\n";
+    return choose_stable_blocking(stage1, fir, ordered_precise_factors);
 }
 
 } // namespace
@@ -1051,259 +1292,20 @@ double exact_return_err_limit(double err_stage1)
 CascadeDecomposition decompose_exact_fs(const DirectFIR& fir,
                                         bool interleave_order)
 {
-    CascadeDecomposition dec;
-    dec.gain = 1.0;
-
-    if (fir.h.empty()) {
-        dec.remainder = {};
-        return dec;
-    }
-
-    const ExactStopbandInfo info = find_exact_stopband_zeros(fir);
-    std::vector<unsigned> pair_order = info.pair_k;
-    if (interleave_order) {
-        pair_order = interleave_indices(std::move(pair_order));
-    } else {
-        std::sort(pair_order.begin(), pair_order.end());
-    }
-
-    if (info.has_dc_zero) {
-        dec.first_order.push_back(FirstOrder{-1});
-    }
-    if (info.has_nyq_zero) {
-        dec.first_order.push_back(FirstOrder{+1});
-    }
-
-    for (unsigned k : pair_order) {
-        const real_t theta =
-            2.0 * PI * static_cast<real_t>(k) / static_cast<real_t>(fir.length());
-        dec.biquads.push_back(Biquad{2.0 * std::cos(theta), k});
-    }
-
-    const std::vector<quad> h_q = real_to_q128(fir.h);
-    std::vector<quad> residual_q = h_q;
-    std::vector<quad> next_q;
-
-    for (const auto& fo : dec.first_order) {
-        q128_first_order_half_divide(residual_q, fo.sign, next_q);
-        enforce_palindromic_symmetry_q128(next_q);
-        residual_q = next_q;
-    }
-
-    std::vector<quad> gamma_order_q;
-    gamma_order_q.reserve(pair_order.size());
-    for (unsigned k : pair_order) {
-        gamma_order_q.push_back(
-            2.0Q * cosq(2.0Q * static_cast<quad>(PI)
-            * static_cast<quad>(k)
-            / static_cast<quad>(fir.length())));
-    }
-
-    const std::vector<quad> base_after_fo = residual_q;
-    static constexpr double QUALITY_THRESHOLD = 1e-6;
-    const std::vector<unsigned> refresh_candidates = {3u, 5u, 8u, 12u};
-    ExactPrefixTrial best_trial;
-
-    bool have_trial = false;
-    for (unsigned refresh_interval : refresh_candidates) {
-        ExactPrefixTrial trial =
-            run_exact_prefix_trial(base_after_fo, gamma_order_q,
-                                   refresh_interval, QUALITY_THRESHOLD);
-        if (!have_trial
-            || trial.accepted_biquad_count > best_trial.accepted_biquad_count
-            || (trial.accepted_biquad_count == best_trial.accepted_biquad_count
-                && trial.rel_err < best_trial.rel_err)) {
-            best_trial = std::move(trial);
-            have_trial = true;
-        }
-    }
-
-    const unsigned accepted_biquad_count = best_trial.accepted_biquad_count;
-    residual_q = std::move(best_trial.quotient);
-
-    std::vector<Biquad> accepted_biquads;
-    accepted_biquads.reserve(accepted_biquad_count);
-    for (unsigned i = 0; i < accepted_biquad_count; ++i) {
-        accepted_biquads.push_back(Biquad{
-            static_cast<real_t>(gamma_order_q[i]),
-            pair_order[i]
-        });
-    }
-
-    if (accepted_biquad_count < pair_order.size()) {
-        std::cerr << "  decompose_exact_fs: accepted "
-                  << accepted_biquad_count << " / " << pair_order.size()
-                  << " exact biquads before residual handoff"
-                  << " (best rel err " << std::scientific << best_trial.rel_err
-                  << ")" << std::defaultfloat << "\n";
-    }
-
-    dec.biquads = std::move(accepted_biquads);
-
-    const std::vector<quad> exact_product = build_exact_factor_product_q128(dec);
-    if (exact_product.size() > 1) {
-        auto [bulk_q, bulk_rem] = q128_poly_divide(h_q, exact_product);
-        const quad max_h_q = std::max(1e-30Q, max_abs_value_q128(h_q));
-        const quad max_rem_q = max_abs_value_q128(bulk_rem);
-        const double max_rem = static_cast<double>(max_rem_q);
-        const double rel_rem = static_cast<double>(max_rem_q / max_h_q);
-
-        if (rel_rem > 1e-8) {
-            std::cerr << "  decompose_exact_fs: bulk diagnostic remainder="
-                      << std::scientific << rel_rem
-                      << " (max abs " << max_rem << ")"
-                      << std::defaultfloat << "\n";
-        }
-
-        if (bulk_q.size() == residual_q.size()) {
-            enforce_palindromic_symmetry_q128(bulk_q);
-        }
-    }
-
-    dec.remainder = q128_to_real(residual_q);
-    return dec;
+    return reduce_by_complement(fir, interleave_order).decomposition;
 }
 
 CascadeDecomposition decompose_exact_fs_full(const DirectFIR& fir,
                                              bool interleave_order)
 {
-    CascadeDecomposition stage1 = decompose_exact_fs(fir, interleave_order);
-    const double err_stage1 = compute_rebuild_max_err(stage1, fir.h, fir.length());
-    const unsigned rem_deg_stage1 =
-        stage1.remainder.empty() ? 0u : static_cast<unsigned>(stage1.remainder.size() - 1);
-
-    CascadeDecomposition structured = stage1;
-    const unsigned accepted_struct = reduce_residual_u_roots(structured, 1e-6, 1e-4, 8);
-    const double err_struct = compute_rebuild_max_err(structured, fir.h, fir.length());
-    const unsigned rem_deg_struct =
-        structured.remainder.empty() ? 0u : static_cast<unsigned>(structured.remainder.size() - 1);
-
-    const bool structured_reduced_degree = rem_deg_struct < rem_deg_stage1;
-    const bool structured_internal_ok =
-        err_struct <= exact_return_err_limit(err_stage1);
-    const bool structured_return_ok =
-        err_struct <= exact_return_err_limit(err_stage1);
-
-    CascadeDecomposition best = stage1;
-    double best_err = err_stage1;
-    unsigned best_rem_deg = rem_deg_stage1;
-
-    auto adopt_if_better =
-        [&](const CascadeDecomposition& cand,
-            double cand_err,
-            unsigned cand_rem_deg,
-            const char* tag,
-            unsigned accepted) {
-            const bool improves_degree = cand_rem_deg < rem_deg_stage1;
-            const bool acceptable_error =
-                cand_err <= exact_return_err_limit(err_stage1);
-            if (accepted == 0 || !improves_degree || !acceptable_error) {
-                return false;
-            }
-            const bool better =
-                (cand_rem_deg < best_rem_deg)
-                || (cand_rem_deg == best_rem_deg && cand_err < best_err);
-            if (!better) {
-                return false;
-            }
-
-            std::cerr << "  exact_fs_full: adopt " << tag
-                      << " (accepted=" << accepted
-                      << ", rem " << rem_deg_stage1 << " -> " << cand_rem_deg
-                      << ", rebuild " << std::scientific << cand_err
-                      << std::defaultfloat << ")\n";
-
-            best = cand;
-            best_err = cand_err;
-            best_rem_deg = cand_rem_deg;
-            return true;
-        };
-
-    if (accepted_struct > 0 && structured_reduced_degree && structured_return_ok) {
-        adopt_if_better(structured, err_struct, rem_deg_struct, "structured", accepted_struct);
-    }
-
-    {
-        CascadeDecomposition full_from_stage1 = stage1;
-        const unsigned accepted_full_stage1 =
-            reduce_residual_u_roots(full_from_stage1, 1e-8, 1e-6, 0);
-        const double err_full_stage1 =
-            compute_rebuild_max_err(full_from_stage1, fir.h, fir.length());
-        const unsigned rem_deg_full_stage1 =
-            full_from_stage1.remainder.empty()
-                ? 0u
-                : static_cast<unsigned>(full_from_stage1.remainder.size() - 1);
-
-        adopt_if_better(full_from_stage1,
-                        err_full_stage1,
-                        rem_deg_full_stage1,
-                        "full-from-stage1",
-                        accepted_full_stage1);
-    }
-
-    if (accepted_struct > 0 && structured_reduced_degree && structured_internal_ok) {
-        CascadeDecomposition full_from_structured = structured;
-        const unsigned accepted_full_structured =
-            reduce_residual_u_roots(full_from_structured, 1e-8, 1e-6, 0);
-        const double err_full_structured =
-            compute_rebuild_max_err(full_from_structured, fir.h, fir.length());
-        const unsigned rem_deg_full_structured =
-            full_from_structured.remainder.empty()
-                ? 0u
-                : static_cast<unsigned>(full_from_structured.remainder.size() - 1);
-
-        adopt_if_better(full_from_structured,
-                        err_full_structured,
-                        rem_deg_full_structured,
-                        "full-from-structured",
-                        accepted_full_structured);
-    }
-
-    if (best_rem_deg == rem_deg_stage1 && best_err == err_stage1) {
-        std::cerr << "  exact_fs_full: fallback to stage1 "
-                  << "(structured accepted=" << accepted_struct
-                  << ", rem " << rem_deg_stage1 << " -> " << rem_deg_struct
-                  << ", rebuild " << std::scientific << err_struct
-                  << " vs stage1 " << err_stage1 << ")"
-                  << std::defaultfloat << "\n";
-    }
-
-    return best;
+    return factor_reduced_residual(
+        fir, reduce_by_complement(fir, interleave_order));
 }
 
 CascadeDecomposition decompose_exact_fs_structured(const DirectFIR& fir,
                                                    bool interleave_order)
 {
-    CascadeDecomposition stage1 = decompose_exact_fs(fir, interleave_order);
-    const double err_stage1 = compute_rebuild_max_err(stage1, fir.h, fir.length());
-    const unsigned rem_deg_stage1 =
-        stage1.remainder.empty() ? 0u : static_cast<unsigned>(stage1.remainder.size() - 1);
-
-    CascadeDecomposition trial = stage1;
-    const unsigned accepted = reduce_residual_u_roots(trial, 1e-6, 1e-4, 8);
-    const double err_trial = compute_rebuild_max_err(trial, fir.h, fir.length());
-    const unsigned rem_deg_trial =
-        trial.remainder.empty() ? 0u : static_cast<unsigned>(trial.remainder.size() - 1);
-
-    const bool reduced_degree = rem_deg_trial < rem_deg_stage1;
-    const bool acceptable_error =
-        err_trial <= exact_return_err_limit(err_stage1);
-
-    if (accepted > 0 && reduced_degree && acceptable_error) {
-        std::cerr << "  exact_fs_structured: accepted " << accepted
-                  << " numerical residual sections"
-                  << ", residual degree " << rem_deg_stage1
-                  << " -> " << rem_deg_trial
-                  << ", rebuild " << std::scientific << err_trial
-                  << std::defaultfloat << "\n";
-        return trial;
-    }
-
-    std::cerr << "  exact_fs_structured: fallback to stage1 "
-              << "(accepted=" << accepted
-              << ", rem " << rem_deg_stage1 << " -> " << rem_deg_trial
-              << ", rebuild " << std::scientific << err_trial
-              << " vs stage1 " << err_stage1 << ")"
-              << std::defaultfloat << "\n";
-    return stage1;
+    // The former greedy residual deflation was neither structured nor stable.
+    // The full path now performs a simultaneous, structure-preserving solve.
+    return decompose_exact_fs_full(fir, interleave_order);
 }

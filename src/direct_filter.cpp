@@ -128,3 +128,16 @@ std::vector<sample_t> filter_direct(const DirectFIR& fir,
 
     return y;
 }
+
+std::vector<double> filter_direct_double(const DirectFIR& fir,
+                                         const std::vector<double>& x)
+{
+    DoubleFilterState state;
+    state.init(fir.h);
+
+    std::vector<double> y(x.size(), 0.0);
+    for (size_t n = 0; n < x.size(); ++n) {
+        y[n] = state.push(x[n]);
+    }
+    return y;
+}

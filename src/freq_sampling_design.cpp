@@ -96,6 +96,13 @@ DirectFIR design_freq_sampling(const FilterSpec& spec,
     if (N < 3) {
         throw std::invalid_argument("design_freq_sampling: N must be >= 3");
     }
+    if (!std::isfinite(spec.fs) || spec.fs <= 0.0
+        || !std::isfinite(spec.f_pass) || spec.f_pass < 0.0
+        || !std::isfinite(spec.f_stop) || spec.f_stop <= spec.f_pass
+        || spec.f_stop > spec.fs / 2.0) {
+        throw std::invalid_argument(
+            "design_freq_sampling: require 0 <= f_pass < f_stop <= fs/2");
+    }
 
     // ──────────────────────────────────────────────────────────
     //  Шаг 1.  Определить амплитуды частотных выборок |H_d[k]|
@@ -107,6 +114,10 @@ DirectFIR design_freq_sampling(const FilterSpec& spec,
 
     const unsigned k_pass = spec.k_pass();   // последний индекс полосы пропускания
     const unsigned k_stop = spec.k_stop();   // первый индекс полосы заграждения
+    if (k_pass >= k_stop || k_stop > N / 2) {
+        throw std::invalid_argument(
+            "design_freq_sampling: pass/stop edges do not leave a valid sampled stopband");
+    }
 
     // Амплитуды (половина спектра, k = 0 .. N-1)
     std::vector<real_t> Hd_mag(N, 0.0);
@@ -119,12 +130,16 @@ DirectFIR design_freq_sampling(const FilterSpec& spec,
     // Полоса перехода: значения из transition_values (если заданы)
     unsigned n_trans = k_stop - k_pass - 1;   // число выборок в переходной полосе
     if (!transition_values.empty()) {
-        if (transition_values.size() < n_trans) {
+        if (transition_values.size() != n_trans) {
             throw std::invalid_argument(
-                "design_freq_sampling: transition_values too short, need "
+                "design_freq_sampling: transition_values size mismatch, need "
                 + std::to_string(n_trans) + " values");
         }
         for (unsigned i = 0; i < n_trans; ++i) {
+            if (!std::isfinite(transition_values[i])) {
+                throw std::invalid_argument(
+                    "design_freq_sampling: transition values must be finite");
+            }
             Hd_mag[k_pass + 1 + i] = transition_values[i];
         }
     }
@@ -168,8 +183,9 @@ DirectFIR design_freq_sampling(const FilterSpec& spec,
     // ──────────────────────────────────────────────────────────
 
     DirectFIR result;
-    result.h    = std::move(h);
-    result.spec = spec;
+    result.h                 = std::move(h);
+    result.spec              = spec;
+    result.frequency_samples = std::move(Hd_mag);
     return result;
 }
 

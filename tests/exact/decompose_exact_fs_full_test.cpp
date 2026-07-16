@@ -2,51 +2,125 @@
 
 #include "test_utils.h"
 
+#include <string>
 #include <vector>
 
 int main()
 {
-    bool ok = true;
-
-    const std::vector<FilterSpec> specs = {
-        {33, 32000.0, 4000.0,  6000.0},
-        {49, 32000.0, 4000.0,  6000.0},
-        {65, 48000.0, 8000.0, 12000.0},
-        {97, 48000.0, 8000.0, 12000.0},
+    struct Case {
+        const char* label;
+        FilterSpec spec;
+        bool smooth_transition;
+        unsigned maximum_expected_block_order;
+        double maximum_impulse_error;
+        double maximum_signal_error;
+        bool high_precision_runtime;
     };
 
-    for (const FilterSpec& spec : specs) {
-        const DirectFIR fir = design_freq_sampling(spec);
-        const CascadeDecomposition s1 = decompose_exact_fs(fir, true);
+    // Native precision is preferred through N257T. N513T verifies the
+    // explicitly reported 50-decimal-digit short-block backend.
+    const std::vector<Case> cases = {
+        {"N32T",  {32,  48000.0, 8000.0, 12000.0}, true,  4,  1e-11, 1e-10, false},
+        {"N33",   {33,  32000.0, 4000.0,  6000.0}, false, 4,  1e-11, 1e-10, false},
+        {"N65T",  {65,  48000.0, 8000.0, 12000.0}, true,  4,  1e-11, 1e-10, false},
+        {"N129",  {129, 48000.0, 8000.0, 12000.0}, false, 4,  1e-10, 1e-9, false},
+        {"N129T", {129, 48000.0, 8000.0, 12000.0}, true,  4,  1e-9,  1e-8, false},
+        {"N257T", {257, 48000.0, 8000.0, 12000.0}, true,  16, 1e-8,  1e-7, false},
+        {"N513T", {513, 48000.0, 8000.0, 12000.0}, true,  8,  1e-9,  1e-8, true},
+        {"N129W", {129, 48000.0, 20000.0, 22000.0}, true, 4, 1e-9, 1e-8, false},
+    };
+
+    bool ok = true;
+    for (const Case& tc : cases) {
+        const std::vector<real_t> transition = tc.smooth_transition
+            ? cosine_transition(tc.spec) : std::vector<real_t>{};
+        const DirectFIR fir = design_freq_sampling(tc.spec, transition);
         const CascadeDecomposition full = decompose_exact_fs_full(fir, true);
+        const std::string prefix = std::string(tc.label) + ": ";
 
-        const double err_s1 = compute_rebuild_err(fir, s1);
-        const double err_full = compute_rebuild_err(fir, full);
-        const unsigned deg_s1 =
-            s1.remainder.empty() ? 0u : static_cast<unsigned>(s1.remainder.size() - 1);
-        const unsigned deg_full =
-            full.remainder.empty() ? 0u : static_cast<unsigned>(full.remainder.size() - 1);
+        ok &= expect(remainder_degree(full) == 0,
+                     prefix + "full factorization left a residual polynomial");
+        const CascadeBuildStatus expected_status = tc.high_precision_runtime
+            ? CascadeBuildStatus::HighPrecisionShortBlockCascade
+            : CascadeBuildStatus::ShortBlockCascade;
+        ok &= expect(full.diagnostics.status == expected_status,
+                     prefix + "expected a verified short-block cascade");
+        ok &= expect(full.diagnostics.runtime_decimal_digits
+                         == (tc.high_precision_runtime ? 50u : 0u),
+                     prefix + "runtime precision selection mismatch");
+        ok &= expect(full.diagnostics.complement_verified,
+                     prefix + "complementary identity was not verified");
+        ok &= expect(full.diagnostics.roots_verified,
+                     prefix + "root set was not verified");
+        ok &= expect(full.diagnostics.runtime_verified,
+                     prefix + "runtime cascade was not verified");
+        ok &= expect(full.zeros_extracted() == fir.order(),
+                     prefix + "full factorization did not cover every root");
+        ok &= expect(!full.blocks.empty(),
+                     prefix + "runtime cascade has no blocks");
+        ok &= expect(full.execution_order.size() == full.blocks.size(),
+                     prefix + "execution order does not cover every block");
+        ok &= expect(maximum_block_order(full)
+                         <= tc.maximum_expected_block_order,
+                     prefix + "adaptive block order exceeded its limit");
+        ok &= expect(full.diagnostics.selected_max_block_order
+                         == maximum_block_order(full),
+                     prefix + "reported block order mismatch");
+        ok &= expect(decomposition_is_finite(full),
+                     prefix + "decomposition contains NaN or infinity");
 
-        const std::string prefix = "N=" + std::to_string(spec.N) + ": ";
-        ok &= expect(err_full <= std::max(1e-6, 10.0 * err_s1),
-                     prefix + "full path worsened rebuild too much");
-        ok &= expect(deg_full <= deg_s1,
-                     prefix + "full path increased residual degree");
+        bool impulse_finite = false;
+        const double impulse_error = cascade_impulse_error_double(
+            fir, full, impulse_finite);
+        ok &= expect(impulse_finite,
+                     prefix + "impulse response contains NaN or infinity");
+        ok &= expect(impulse_error <= tc.maximum_impulse_error,
+                     prefix + "impulse max error="
+                         + std::to_string(impulse_error));
+        ok &= expect(std::abs(impulse_error
+                              - full.diagnostics.runtime_impulse_error)
+                         <= 1e-18,
+                     prefix + "reported impulse error mismatch");
 
-        if (spec.N <= 49) {
-            ok &= expect(err_full <= 10.0 * std::max(1e-12, err_s1),
-                         prefix + "small-N full path should stay near stage1 quality");
+        bool signal_finite = false;
+        const double signal_error = cascade_signal_error_double(
+            fir, full, signal_finite,
+            tc.high_precision_runtime ? 64u : 0u);
+        ok &= expect(signal_finite,
+                     prefix + "bounded-signal output contains NaN or infinity");
+        ok &= expect(signal_error <= tc.maximum_signal_error,
+                     prefix + "bounded-signal max error="
+                         + std::to_string(signal_error));
+
+        if (tc.high_precision_runtime) {
+            std::vector<sample_t> short_impulse(32u, 0.0f);
+            short_impulse[0] = 1.0f;
+            const CompareMetrics float_impulse = compare_signals(
+                filter_direct(fir, short_impulse),
+                filter_cascade(full, short_impulse));
+            ok &= expect(float_impulse.max_abs_err <= 1e-6,
+                         prefix + "float API did not use the verified backend");
         }
-
-        const CompareMetrics noi_s1 =
-            cascade_noise_metrics(fir, s1, 50000u, 1700u + spec.N);
-        const CompareMetrics noi_full =
-            cascade_noise_metrics(fir, full, 50000u, 1700u + spec.N);
-        ok &= expect(noi_full.snr_db >= 110.0,
-                     prefix + "full path noise SNR too low: " + std::to_string(noi_full.snr_db));
-        ok &= expect(noi_full.snr_db >= noi_s1.snr_db - 10.0,
-                     prefix + "full path lost too much noise SNR vs stage1");
     }
+
+    // If h[n] no longer matches the stored frequency samples, the factorized
+    // candidates cannot reproduce the requested direct filter. The public full
+    // path must then return an explicit, verified direct-form fallback.
+    DirectFIR inconsistent = design_freq_sampling(
+        {33, 32000.0, 4000.0, 6000.0});
+    inconsistent.h.front() += 1e-3;
+    const CascadeDecomposition fallback =
+        decompose_exact_fs_full(inconsistent, true);
+    bool fallback_finite = false;
+    const double fallback_error = cascade_impulse_error_double(
+        inconsistent, fallback, fallback_finite);
+    ok &= expect(fallback.diagnostics.status
+                     == CascadeBuildStatus::DirectFormFallback,
+                 "inconsistent input should use direct-form fallback");
+    ok &= expect(fallback.diagnostics.runtime_verified && fallback_finite,
+                 "direct-form fallback should be finite and verified");
+    ok &= expect(fallback_error == 0.0,
+                 "direct-form fallback should preserve h[n] exactly");
 
     return ok ? 0 : 1;
 }
