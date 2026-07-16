@@ -62,11 +62,13 @@ int main()
     const std::string truncated_path = path + ".truncated";
     const std::string version_path = path + ".version";
     const std::string extended_path = path + ".extended";
+    const std::string double_double_path = path + ".double-double";
     std::remove(path.c_str());
     std::remove(corrupt_path.c_str());
     std::remove(truncated_path.c_str());
     std::remove(version_path.c_str());
     std::remove(extended_path.c_str());
+    std::remove(double_double_path.c_str());
 
     bool ok = true;
     DirectFIR empty;
@@ -138,6 +140,33 @@ int main()
                      == CascadeRuntimePrecision::Extended50,
                  "artifact should preserve an extended runtime backend");
 
+    CascadeDecomposition double_double = dec;
+    double_double.runtime_precision =
+        CascadeRuntimePrecision::DoubleDouble;
+    double_double.diagnostics.runtime_decimal_digits = 31u;
+    const CascadeArtifact double_double_artifact =
+        make_cascade_artifact(fir, double_double);
+    save_cascade_artifact(double_double_path, double_double_artifact);
+    const CascadeArtifact loaded_double_double =
+        load_cascade_artifact(double_double_path);
+    ok &= expect(loaded_double_double.decomposition.runtime_precision
+                     == CascadeRuntimePrecision::DoubleDouble,
+                 "artifact should preserve double-double precision");
+    CascadeFilterState scalar_double_double;
+    scalar_double_double.init(
+        loaded_double_double.decomposition,
+        CascadeRuntimeOptions{false, CascadeRuntimeKernel::Scalar});
+    ok &= expect(std::isfinite(scalar_double_double.push_double(0.25)),
+                 "scalar double-double backend should be finite");
+    CascadeFilterState automatic_double_double;
+    automatic_double_double.init(loaded_double_double.decomposition);
+    const CascadeRuntimeKernel automatic_kernel =
+        cascade_runtime_kernel_available(CascadeRuntimeKernel::Avx2Fma)
+        ? CascadeRuntimeKernel::Avx2Fma
+        : CascadeRuntimeKernel::Scalar;
+    ok &= expect(automatic_double_double.selected_kernel == automatic_kernel,
+                 "double-double runtime dispatch mismatch");
+
     CascadeArtifact bad_index = artifact;
     bad_index.decomposition.execution_order.front().index = 1u;
     ok &= expect(throws<std::invalid_argument>([&] {
@@ -186,5 +215,6 @@ int main()
     std::remove(truncated_path.c_str());
     std::remove(version_path.c_str());
     std::remove(extended_path.c_str());
+    std::remove(double_double_path.c_str());
     return ok ? 0 : 1;
 }

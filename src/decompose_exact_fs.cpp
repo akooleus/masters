@@ -1005,7 +1005,7 @@ double cascade_impulse_error(const CascadeDecomposition& dec,
     std::vector<double> impulse(fir.length() * 2u, 0.0);
     impulse[0] = 1.0;
     CascadeFilterState state;
-    state.init(dec);
+    state.init(dec, CascadeRuntimeOptions{true, CascadeRuntimeKernel::Scalar});
     double max_error = 0.0;
     for (size_t i = 0; i < impulse.size(); ++i) {
         const double output = state.push_double(impulse[i]);
@@ -1187,7 +1187,7 @@ CascadeDecomposition choose_stable_blocking(
                 block_coefficient_error_mp(bases.front(), fir);
             if (std::isfinite(coefficient_error)
                 && coefficient_error <= tolerance) {
-                static constexpr unsigned precision_candidates[] = {34, 50};
+                static constexpr unsigned precision_candidates[] = {31, 34, 50};
                 for (unsigned digits : precision_candidates) {
                     long double best_mp_peak =
                         std::numeric_limits<long double>::infinity();
@@ -1201,9 +1201,11 @@ CascadeDecomposition choose_stable_blocking(
                                                   / GAIN_DISTRIBUTION_STEPS;
                             distribute_block_gain(candidate, fraction);
                             candidate.diagnostics.runtime_decimal_digits = digits;
-                            candidate.runtime_precision = (digits == 34u)
-                                ? CascadeRuntimePrecision::Extended34
-                                : CascadeRuntimePrecision::Extended50;
+                            candidate.runtime_precision = (digits == 31u)
+                                ? CascadeRuntimePrecision::DoubleDouble
+                                : ((digits == 34u)
+                                    ? CascadeRuntimePrecision::Extended34
+                                    : CascadeRuntimePrecision::Extended50);
                             candidate.diagnostics.status =
                                 CascadeBuildStatus::HighPrecisionShortBlockCascade;
                             long double mp_peak = 0.0L;

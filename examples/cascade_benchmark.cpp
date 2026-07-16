@@ -98,14 +98,17 @@ Timing benchmark_cascade(const CascadeDecomposition& dec,
                          const std::vector<double>& input,
                          size_t warmup,
                          size_t samples,
-                         unsigned repeats)
+                         unsigned repeats,
+                         bool track_peak,
+                         CascadeRuntimeKernel kernel)
 {
     std::vector<double> timings;
     timings.reserve(repeats);
     Timing result;
     for (unsigned repeat = 0; repeat < repeats; ++repeat) {
         CascadeFilterState state;
-        state.init(dec);
+        state.init(dec, CascadeRuntimeOptions{
+            track_peak, kernel});
         for (size_t i = 0; i < warmup; ++i) {
             result.checksum += state.push_double(input[i]);
         }
@@ -128,18 +131,34 @@ Timing benchmark_cascade(const CascadeDecomposition& dec,
 double maximum_signal_error(const DirectFIR& fir,
                             const CascadeDecomposition& dec,
                             const std::vector<double>& input,
-                            size_t samples)
+                            size_t samples,
+                            CascadeRuntimeKernel kernel)
 {
     DoubleFilterState direct;
     direct.init(fir.h);
     CascadeFilterState cascade;
-    cascade.init(dec);
+    cascade.init(dec, CascadeRuntimeOptions{false, kernel});
 
     double maximum = 0.0;
     for (size_t i = 0; i < samples; ++i) {
         maximum = std::max(
             maximum,
             std::abs(direct.push(input[i]) - cascade.push_double(input[i])));
+    }
+    return maximum;
+}
+
+double maximum_impulse_error(const DirectFIR& fir,
+                             const CascadeDecomposition& dec,
+                             CascadeRuntimeKernel kernel)
+{
+    CascadeFilterState cascade;
+    cascade.init(dec, CascadeRuntimeOptions{false, kernel});
+    double maximum = 0.0;
+    for (size_t i = 0; i < fir.length() * 2u; ++i) {
+        const double output = cascade.push_double(i == 0u ? 1.0 : 0.0);
+        const double expected = (i < fir.h.size()) ? fir.h[i] : 0.0;
+        maximum = std::max(maximum, std::abs(output - expected));
     }
     return maximum;
 }
@@ -171,6 +190,27 @@ const char* status_name(CascadeBuildStatus status)
     return "unknown";
 }
 
+const char* precision_name(CascadeRuntimePrecision precision)
+{
+    switch (precision) {
+    case CascadeRuntimePrecision::Native: return "native";
+    case CascadeRuntimePrecision::DoubleDouble: return "double-double";
+    case CascadeRuntimePrecision::Extended34: return "extended34";
+    case CascadeRuntimePrecision::Extended50: return "extended50";
+    }
+    return "unknown";
+}
+
+const char* kernel_name(CascadeRuntimeKernel kernel)
+{
+    switch (kernel) {
+    case CascadeRuntimeKernel::Auto: return "auto";
+    case CascadeRuntimeKernel::Scalar: return "scalar";
+    case CascadeRuntimeKernel::Avx2Fma: return "avx2-fma";
+    }
+    return "unknown";
+}
+
 size_t parse_size(const char* value, const char* name)
 {
     char* end = nullptr;
@@ -180,6 +220,24 @@ size_t parse_size(const char* value, const char* name)
         std::exit(2);
     }
     return static_cast<size_t>(parsed);
+}
+
+CascadeRuntimeKernel parse_kernel(const char* value)
+{
+    const std::string name(value);
+    if (name == "auto") {
+        return CascadeRuntimeKernel::Auto;
+    }
+    if (name == "scalar") {
+        return CascadeRuntimeKernel::Scalar;
+    }
+    if (name == "avx2" || name == "avx2-fma") {
+        return CascadeRuntimeKernel::Avx2Fma;
+    }
+    std::fprintf(stderr,
+                 "invalid kernel: %s (expected auto, scalar or avx2)\n",
+                 value);
+    std::exit(2);
 }
 
 } // namespace
@@ -201,9 +259,9 @@ int main(int argc, char** argv)
                      requested.c_str());
         return 2;
     }
-    if (argc > 5) {
+    if (argc > 6) {
         std::fprintf(stderr,
-                     "usage: %s [N257T|N513T] [samples] [repeats] [artifact]\n",
+                     "usage: %s [N257T|N513T] [samples] [repeats] [artifact] [kernel]\n",
                      argv[0]);
         return 2;
     }
@@ -213,6 +271,8 @@ int main(int argc, char** argv)
     const unsigned repeats = static_cast<unsigned>(
         (argc > 3) ? parse_size(argv[3], "repeat count") : 5u);
     const std::string artifact_path = (argc > 4) ? argv[4] : "";
+    const CascadeRuntimeKernel requested_kernel = (argc > 5)
+        ? parse_kernel(argv[5]) : CascadeRuntimeKernel::Auto;
     const size_t direct_samples = std::max<size_t>(262144u, cascade_samples);
     const size_t warmup = 4096u;
     const size_t input_size = warmup + std::max(direct_samples, cascade_samples);
@@ -295,27 +355,42 @@ int main(int argc, char** argv)
 
     const auto cascade_init_start = Clock::now();
     CascadeFilterState cascade_init_probe;
-    cascade_init_probe.init(dec);
+    try {
+        cascade_init_probe.init(
+            dec, CascadeRuntimeOptions{false, requested_kernel});
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "runtime kernel error: %s\n", error.what());
+        return 2;
+    }
     const double cascade_init_us = std::chrono::duration<double, std::micro>(
         Clock::now() - cascade_init_start).count();
 
     const Timing direct = benchmark_direct(
         fir, input, warmup, direct_samples, repeats);
     const Timing cascade = benchmark_cascade(
-        dec, input, warmup, cascade_samples, repeats);
+        dec, input, warmup, cascade_samples, repeats,
+        false, requested_kernel);
+    const Timing cascade_tracked = benchmark_cascade(
+        dec, input, warmup, cascade_samples, repeats,
+        true, requested_kernel);
     const size_t error_samples = std::min<size_t>(4096u, cascade_samples);
     const double signal_error = maximum_signal_error(
-        fir, dec, input, error_samples);
+        fir, dec, input, error_samples, requested_kernel);
+    const double impulse_error = maximum_impulse_error(
+        fir, dec, requested_kernel);
 
     const double direct_msamples = 1000.0 / direct.median_ns_per_sample;
     const double cascade_msamples = 1000.0 / cascade.median_ns_per_sample;
     const double realtime_factor = cascade_msamples * 1e6 / selected->spec.fs;
 
-    std::printf("case=%s N=%u status=%s blocks=%zu max_order=%u digits=%u\n",
+    std::printf("case=%s N=%u status=%s blocks=%zu max_order=%u precision=%s digits=%u kernel=%s verified_impulse_error=%.6e\n",
                 selected->label, selected->spec.N,
                 status_name(dec.diagnostics.status), dec.blocks.size(),
                 maximum_block_order(dec),
-                dec.diagnostics.runtime_decimal_digits);
+                precision_name(dec.runtime_precision),
+                dec.diagnostics.runtime_decimal_digits,
+                kernel_name(cascade_init_probe.selected_kernel),
+                dec.diagnostics.runtime_impulse_error);
     std::printf("design_ms=%.3f decompose_ms=%.3f direct_init_us=%.3f cascade_init_us=%.3f\n",
                 design_ms, decompose_ms, direct_init_us, cascade_init_us);
     std::printf("artifact_mode=%s artifact_bytes=%zu save_ms=%.3f load_ms=%.3f\n",
@@ -326,8 +401,14 @@ int main(int argc, char** argv)
     std::printf("cascade_samples=%zu cascade_ns_per_sample=%.3f cascade_Msample_s=%.6f realtime_x=%.3f\n",
                 cascade_samples, cascade.median_ns_per_sample,
                 cascade_msamples, realtime_factor);
-    std::printf("error_samples=%zu max_signal_error=%.6e runtime_peak=%.6Le checksum=%.12e\n",
-                error_samples, signal_error, cascade.peak_internal,
+    std::printf("cascade_tracked_ns_per_sample=%.3f peak_tracking_overhead_x=%.3f runtime_peak=%.6Le\n",
+                cascade_tracked.median_ns_per_sample,
+                cascade_tracked.median_ns_per_sample
+                    / cascade.median_ns_per_sample,
+                cascade_tracked.peak_internal);
+    std::printf("error_samples=%zu max_impulse_error=%.6e max_signal_error=%.6e checksum=%.12e\n",
+                error_samples, impulse_error, signal_error,
                 direct.checksum + cascade.checksum);
-    return std::isfinite(signal_error) ? 0 : 1;
+    return (std::isfinite(impulse_error) && std::isfinite(signal_error))
+        ? 0 : 1;
 }

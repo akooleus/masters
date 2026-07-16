@@ -18,9 +18,10 @@
 //  Полином-остаток фильтруется прямой свёрткой (через
 //  DirectFilterState).
 //
-//  Обычный путь использует double/long double. Для декомпозиций с
-//  явно указанным runtime_precision создаётся отдельное состояние binary128
-//  либо Boost.Multiprecision; поля диагностики backend не выбирают.
+//  Обычный путь использует double/long double. Для декомпозиций с явно
+//  указанным runtime_precision создаётся состояние double-double, binary128
+//  либо Boost.Multiprecision. ISA-kernel выбирается отдельно от численной
+//  точности; поля диагностики backend не выбирают.
 //
 //  Собственная реализация настоящей работы.
 // ═══════════════════════════════════════════════════════════════
@@ -30,6 +31,14 @@
 #include <boost/multiprecision/cpp_bin_float.hpp>
 
 #include <stdexcept>
+
+#if (defined(__x86_64__) || defined(__i386__)) \
+    && (defined(__GNUC__) || defined(__clang__))
+#include <immintrin.h>
+#define CASCADE_HAS_X86_AVX2_TARGET 1
+#else
+#define CASCADE_HAS_X86_AVX2_TARGET 0
+#endif
 
 namespace {
 
@@ -154,6 +163,7 @@ void validate_runtime_decomposition(const CascadeDecomposition& dec)
     switch (dec.runtime_precision) {
     case CascadeRuntimePrecision::Native:
         break;
+    case CascadeRuntimePrecision::DoubleDouble:
     case CascadeRuntimePrecision::Extended34:
     case CascadeRuntimePrecision::Extended50:
         if (!dec.first_order.empty() || !dec.biquads.empty()
@@ -176,8 +186,10 @@ void validate_runtime_decomposition(const CascadeDecomposition& dec)
 template <class RuntimeReal>
 class MultiprecisionCascadeState final : public CascadeExtendedState {
 public:
-    explicit MultiprecisionCascadeState(const CascadeDecomposition& dec)
-        : execution_order_(dec.execution_order), gain_(dec.runtime_gain)
+    explicit MultiprecisionCascadeState(const CascadeDecomposition& dec,
+                                        bool track_peak)
+        : execution_order_(dec.execution_order), gain_(dec.runtime_gain),
+          track_peak_(track_peak)
     {
         blocks_.resize(dec.blocks.size());
         for (size_t i = 0; i < dec.blocks.size(); ++i) {
@@ -295,6 +307,9 @@ private:
 
     void update_peak(const RuntimeReal& value)
     {
+        if (!track_peak_) {
+            return;
+        }
         const long double magnitude =
             std::abs(static_cast<long double>(value));
         peak_ = std::max(peak_, magnitude);
@@ -306,9 +321,406 @@ private:
     std::vector<RuntimeReal> remainder_delay_;
     RuntimeReal gain_;
     long double peak_ = 0.0L;
+    bool track_peak_ = false;
+};
+
+struct DoubleDouble {
+    double high;
+    double low;
+};
+
+DoubleDouble quick_two_sum(double a, double b)
+{
+    const double sum = a + b;
+    return {sum, b - (sum - a)};
+}
+
+DoubleDouble two_sum(double a, double b)
+{
+    const double sum = a + b;
+    const double b_virtual = sum - a;
+    const double error = (a - (sum - b_virtual)) + (b - b_virtual);
+    return {sum, error};
+}
+
+DoubleDouble add_double_double(DoubleDouble a, DoubleDouble b)
+{
+    DoubleDouble high = two_sum(a.high, b.high);
+    DoubleDouble low = two_sum(a.low, b.low);
+    high.low += low.high;
+    high = quick_two_sum(high.high, high.low);
+    high.low += low.low;
+    return quick_two_sum(high.high, high.low);
+}
+
+double product_error(double a, double b, double product)
+{
+    // Dekker split: exact product residual without requiring FMA support.
+    static constexpr double SPLITTER = 134217729.0; // 2^27 + 1
+    const double a_split = SPLITTER * a;
+    const double a_high = a_split - (a_split - a);
+    const double a_low = a - a_high;
+    const double b_split = SPLITTER * b;
+    const double b_high = b_split - (b_split - b);
+    const double b_low = b - b_high;
+    return ((a_high * b_high - product) + a_high * b_low
+            + a_low * b_high) + a_low * b_low;
+}
+
+DoubleDouble multiply_double_double(DoubleDouble value, double factor)
+{
+    const double product = value.high * factor;
+    const double error = product_error(value.high, factor, product)
+                       + value.low * factor;
+    return quick_two_sum(product, error);
+}
+
+bool cpu_supports_avx2_fma()
+{
+#if CASCADE_HAS_X86_AVX2_TARGET
+    __builtin_cpu_init();
+    return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+#else
+    return false;
+#endif
+}
+
+#if CASCADE_HAS_X86_AVX2_TARGET
+
+struct DoubleDoubleVector {
+    __m256d high;
+    __m256d low;
+};
+
+__attribute__((target("avx2,fma")))
+DoubleDoubleVector quick_two_sum_vector(__m256d a, __m256d b)
+{
+    const __m256d sum = _mm256_add_pd(a, b);
+    return {sum, _mm256_sub_pd(b, _mm256_sub_pd(sum, a))};
+}
+
+__attribute__((target("avx2,fma")))
+DoubleDoubleVector two_sum_vector(__m256d a, __m256d b)
+{
+    const __m256d sum = _mm256_add_pd(a, b);
+    const __m256d b_virtual = _mm256_sub_pd(sum, a);
+    const __m256d error = _mm256_add_pd(
+        _mm256_sub_pd(a, _mm256_sub_pd(sum, b_virtual)),
+        _mm256_sub_pd(b, b_virtual));
+    return {sum, error};
+}
+
+__attribute__((target("avx2,fma")))
+DoubleDoubleVector add_double_double_vector(DoubleDoubleVector a,
+                                           DoubleDoubleVector b)
+{
+    DoubleDoubleVector high = two_sum_vector(a.high, b.high);
+    DoubleDoubleVector low = two_sum_vector(a.low, b.low);
+    high.low = _mm256_add_pd(high.low, low.high);
+    high = quick_two_sum_vector(high.high, high.low);
+    high.low = _mm256_add_pd(high.low, low.low);
+    return quick_two_sum_vector(high.high, high.low);
+}
+
+__attribute__((target("avx2,fma")))
+DoubleDoubleVector multiply_double_double_vector(
+    const double* high,
+    const double* low,
+    const double* factors)
+{
+    const __m256d value_high = _mm256_loadu_pd(high);
+    const __m256d value_low = _mm256_loadu_pd(low);
+    const __m256d factor = _mm256_loadu_pd(factors);
+    const __m256d product = _mm256_mul_pd(value_high, factor);
+    const __m256d error = _mm256_add_pd(
+        _mm256_fmsub_pd(value_high, factor, product),
+        _mm256_mul_pd(value_low, factor));
+    return quick_two_sum_vector(product, error);
+}
+
+__attribute__((target("avx2,fma")))
+DoubleDouble reduce_double_double_vector(DoubleDoubleVector value)
+{
+    DoubleDoubleVector swapped{
+        _mm256_permute2f128_pd(value.high, value.high, 0x01),
+        _mm256_permute2f128_pd(value.low, value.low, 0x01)};
+    value = add_double_double_vector(value, swapped);
+    swapped = {
+        _mm256_permute_pd(value.high, 0x05),
+        _mm256_permute_pd(value.low, 0x05)};
+    value = add_double_double_vector(value, swapped);
+    return {
+        _mm_cvtsd_f64(_mm256_castpd256_pd128(value.high)),
+        _mm_cvtsd_f64(_mm256_castpd256_pd128(value.low))};
+}
+
+__attribute__((target("avx2,fma")))
+DoubleDouble multiply_double_double_fma(DoubleDouble value, double factor)
+{
+    const double product = value.high * factor;
+    const double error = std::fma(value.high, factor, -product)
+                       + value.low * factor;
+    return quick_two_sum(product, error);
+}
+
+__attribute__((target("avx2,fma")))
+DoubleDouble dot_order_8_avx2(const double* coefficients,
+                              const double* delay_high,
+                              const double* delay_low,
+                              DoubleDouble current)
+{
+    DoubleDoubleVector products = multiply_double_double_vector(
+        delay_high, delay_low, coefficients + 1u);
+    const DoubleDoubleVector upper = multiply_double_double_vector(
+        delay_high + 4u, delay_low + 4u, coefficients + 5u);
+    products = add_double_double_vector(products, upper);
+    const DoubleDouble delayed_sum = reduce_double_double_vector(products);
+    return add_double_double(
+        multiply_double_double_fma(current, coefficients[0]), delayed_sum);
+}
+
+__attribute__((target("avx2,fma")))
+DoubleDouble dot_order_4_avx2(const double* coefficients,
+                              const double* delay_high,
+                              const double* delay_low,
+                              DoubleDouble current)
+{
+    const DoubleDoubleVector products = multiply_double_double_vector(
+        delay_high, delay_low, coefficients + 1u);
+    const DoubleDouble delayed_sum = reduce_double_double_vector(products);
+    return add_double_double(
+        multiply_double_double_fma(current, coefficients[0]), delayed_sum);
+}
+
+#endif
+
+class DoubleDoubleCascadeState final : public CascadeExtendedState {
+public:
+    explicit DoubleDoubleCascadeState(const CascadeDecomposition& dec,
+                                      bool track_peak,
+                                      bool use_avx2)
+        : execution_order_(dec.execution_order), remainder_(dec.remainder),
+          gain_(dec.runtime_gain), track_peak_(track_peak),
+          use_avx2_(use_avx2)
+    {
+        blocks_.resize(dec.blocks.size());
+        for (size_t i = 0; i < dec.blocks.size(); ++i) {
+            blocks_[i].coefficients = dec.blocks[i].coefficients;
+            const size_t order = dec.blocks[i].coefficients.size() - 1u;
+            blocks_[i].delay_high.assign(order, 0.0);
+            blocks_[i].delay_low.assign(order, 0.0);
+        }
+        const size_t remainder_order = remainder_.size() - 1u;
+        remainder_delay_.assign(
+            remainder_order, DoubleDouble{0.0, 0.0});
+    }
+
+    double push(double x) override
+    {
+        DoubleDouble value{x, 0.0};
+        update_peak(value);
+        for (const CascadeSectionPlacement& placement : execution_order_) {
+            Block& block = blocks_[placement.index];
+            DoubleDouble output;
+            if (block.coefficients.size() == 9u) {
+#if CASCADE_HAS_X86_AVX2_TARGET
+                output = use_avx2_
+                    ? dot_order_8_avx2(
+                        block.coefficients.data(),
+                        block.delay_high.data(),
+                        block.delay_low.data(), value)
+                    : dot_order_8(block, value);
+#else
+                output = dot_order_8(block, value);
+#endif
+                shift_order_8(block, value);
+            } else if (block.coefficients.size() == 5u) {
+#if CASCADE_HAS_X86_AVX2_TARGET
+                output = use_avx2_
+                    ? dot_order_4_avx2(
+                        block.coefficients.data(),
+                        block.delay_high.data(),
+                        block.delay_low.data(), value)
+                    : dot_order_4(block, value);
+#else
+                output = dot_order_4(block, value);
+#endif
+                shift_order_4(block, value);
+            } else {
+                output = multiply_double_double(
+                    value, block.coefficients.front());
+                for (size_t i = 1; i < block.coefficients.size(); ++i) {
+                    output = add_double_double(
+                        output,
+                        multiply_double_double(
+                            delay(block, i - 1u), block.coefficients[i]));
+                }
+                for (size_t i = block.delay_high.size(); i-- > 1u;) {
+                    block.delay_high[i] = block.delay_high[i - 1u];
+                    block.delay_low[i] = block.delay_low[i - 1u];
+                }
+                if (!block.delay_high.empty()) {
+                    set_delay(block, 0u, value);
+                }
+            }
+            value = multiply_double_double(output, placement.scale);
+            update_peak(value);
+        }
+
+        if (remainder_.size() == 1u) {
+            value = multiply_double_double(value, remainder_.front());
+        } else {
+            DoubleDouble output = multiply_double_double(
+                value, remainder_.front());
+            for (size_t i = 1; i < remainder_.size(); ++i) {
+                output = add_double_double(
+                    output,
+                    multiply_double_double(
+                        remainder_delay_[i - 1u], remainder_[i]));
+            }
+            for (size_t i = remainder_delay_.size(); i-- > 1u;) {
+                remainder_delay_[i] = remainder_delay_[i - 1u];
+            }
+            if (!remainder_delay_.empty()) {
+                remainder_delay_[0] = value;
+            }
+            value = output;
+        }
+
+        value = multiply_double_double(value, gain_);
+        update_peak(value);
+        return value.high + value.low;
+    }
+
+    void reset() override
+    {
+        for (Block& block : blocks_) {
+            std::fill(block.delay_high.begin(), block.delay_high.end(), 0.0);
+            std::fill(block.delay_low.begin(), block.delay_low.end(), 0.0);
+        }
+        std::fill(
+            remainder_delay_.begin(), remainder_delay_.end(),
+            DoubleDouble{0.0, 0.0});
+        peak_ = 0.0L;
+    }
+
+    long double peak() const override
+    {
+        return peak_;
+    }
+
+private:
+    struct Block {
+        std::vector<double> coefficients;
+        std::vector<double> delay_high;
+        std::vector<double> delay_low;
+    };
+
+    static DoubleDouble delay(const Block& block, size_t index)
+    {
+        return {block.delay_high[index], block.delay_low[index]};
+    }
+
+    static void set_delay(Block& block,
+                          size_t index,
+                          DoubleDouble value)
+    {
+        block.delay_high[index] = value.high;
+        block.delay_low[index] = value.low;
+    }
+
+    static DoubleDouble dot_order_4(const Block& block,
+                                    DoubleDouble value)
+    {
+        DoubleDouble output = multiply_double_double(
+            value, block.coefficients[0]);
+        output = add_double_double(output, multiply_double_double(
+            delay(block, 0u), block.coefficients[1]));
+        output = add_double_double(output, multiply_double_double(
+            delay(block, 1u), block.coefficients[2]));
+        output = add_double_double(output, multiply_double_double(
+            delay(block, 2u), block.coefficients[3]));
+        return add_double_double(output, multiply_double_double(
+            delay(block, 3u), block.coefficients[4]));
+    }
+
+    static DoubleDouble dot_order_8(const Block& block,
+                                    DoubleDouble value)
+    {
+        DoubleDouble output = multiply_double_double(
+            value, block.coefficients[0]);
+        output = add_double_double(output, multiply_double_double(
+            delay(block, 0u), block.coefficients[1]));
+        output = add_double_double(output, multiply_double_double(
+            delay(block, 1u), block.coefficients[2]));
+        output = add_double_double(output, multiply_double_double(
+            delay(block, 2u), block.coefficients[3]));
+        output = add_double_double(output, multiply_double_double(
+            delay(block, 3u), block.coefficients[4]));
+        output = add_double_double(output, multiply_double_double(
+            delay(block, 4u), block.coefficients[5]));
+        output = add_double_double(output, multiply_double_double(
+            delay(block, 5u), block.coefficients[6]));
+        output = add_double_double(output, multiply_double_double(
+            delay(block, 6u), block.coefficients[7]));
+        return add_double_double(output, multiply_double_double(
+            delay(block, 7u), block.coefficients[8]));
+    }
+
+    static void shift_order_4(Block& block, DoubleDouble value)
+    {
+        set_delay(block, 3u, delay(block, 2u));
+        set_delay(block, 2u, delay(block, 1u));
+        set_delay(block, 1u, delay(block, 0u));
+        set_delay(block, 0u, value);
+    }
+
+    static void shift_order_8(Block& block, DoubleDouble value)
+    {
+        set_delay(block, 7u, delay(block, 6u));
+        set_delay(block, 6u, delay(block, 5u));
+        set_delay(block, 5u, delay(block, 4u));
+        set_delay(block, 4u, delay(block, 3u));
+        set_delay(block, 3u, delay(block, 2u));
+        set_delay(block, 2u, delay(block, 1u));
+        set_delay(block, 1u, delay(block, 0u));
+        set_delay(block, 0u, value);
+    }
+
+    void update_peak(DoubleDouble value)
+    {
+        if (!track_peak_) {
+            return;
+        }
+        const long double magnitude = std::abs(
+            static_cast<long double>(value.high)
+            + static_cast<long double>(value.low));
+        peak_ = std::max(peak_, magnitude);
+    }
+
+    std::vector<Block> blocks_;
+    std::vector<CascadeSectionPlacement> execution_order_;
+    std::vector<double> remainder_;
+    std::vector<DoubleDouble> remainder_delay_;
+    double gain_;
+    long double peak_ = 0.0L;
+    bool track_peak_ = false;
+    bool use_avx2_ = false;
 };
 
 } // namespace
+
+bool cascade_runtime_kernel_available(CascadeRuntimeKernel kernel)
+{
+    switch (kernel) {
+    case CascadeRuntimeKernel::Auto:
+    case CascadeRuntimeKernel::Scalar:
+        return true;
+    case CascadeRuntimeKernel::Avx2Fma:
+        return cpu_supports_avx2_fma();
+    }
+    return false;
+}
 
 // ═══════════════════════════════════════════════════════════════
 //  DoubleFilterState — прямая свёртка целиком в double
@@ -384,10 +796,13 @@ double DoubleFilterState::push(double x)
 //  каскада и для прямого фильтра-остатка.
 // ═══════════════════════════════════════════════════════════════
 
-void CascadeFilterState::init(const CascadeDecomposition& dec)
+void CascadeFilterState::init(const CascadeDecomposition& dec,
+                              CascadeRuntimeOptions options)
 {
     initialized = false;
     validate_runtime_decomposition(dec);
+    track_peak = options.track_peak;
+    selected_kernel = CascadeRuntimeKernel::Scalar;
     // Межсекционное масштабирование уменьшает рост промежуточных
     // амплитуд в длинных каскадах. Для каждого звена используем
     // безопасную верхнюю оценку его усиления через L1-норму
@@ -400,12 +815,37 @@ void CascadeFilterState::init(const CascadeDecomposition& dec)
     qt_states.clear();
     block_states.clear();
     if (dec.runtime_precision != CascadeRuntimePrecision::Native) {
-        if (dec.runtime_precision == CascadeRuntimePrecision::Extended34) {
+        if (dec.runtime_precision == CascadeRuntimePrecision::DoubleDouble) {
+            const bool avx2_available = cpu_supports_avx2_fma();
+            if (options.kernel == CascadeRuntimeKernel::Avx2Fma
+                && !avx2_available) {
+                throw std::invalid_argument(
+                    "AVX2/FMA cascade kernel is unavailable on this CPU");
+            }
+            const bool use_avx2 = avx2_available
+                && options.kernel != CascadeRuntimeKernel::Scalar;
             extended_state =
-                std::make_unique<MultiprecisionCascadeState<runtime_mp34>>(dec);
+                std::make_unique<DoubleDoubleCascadeState>(
+                    dec, track_peak, use_avx2);
+            selected_kernel = use_avx2
+                ? CascadeRuntimeKernel::Avx2Fma
+                : CascadeRuntimeKernel::Scalar;
+        } else if (dec.runtime_precision == CascadeRuntimePrecision::Extended34) {
+            if (options.kernel == CascadeRuntimeKernel::Avx2Fma) {
+                throw std::invalid_argument(
+                    "AVX2/FMA does not implement binary128 arithmetic");
+            }
+            extended_state =
+                std::make_unique<MultiprecisionCascadeState<runtime_mp34>>(
+                    dec, track_peak);
         } else if (dec.runtime_precision == CascadeRuntimePrecision::Extended50) {
+            if (options.kernel == CascadeRuntimeKernel::Avx2Fma) {
+                throw std::invalid_argument(
+                    "AVX2/FMA does not implement Extended50 arithmetic");
+            }
             extended_state =
-                std::make_unique<MultiprecisionCascadeState<runtime_mp50>>(dec);
+                std::make_unique<MultiprecisionCascadeState<runtime_mp50>>(
+                    dec, track_peak);
         } else {
             throw std::invalid_argument(
                 "unsupported cascade runtime precision");
@@ -413,6 +853,10 @@ void CascadeFilterState::init(const CascadeDecomposition& dec)
         gain = 1.0;
         initialized = true;
         return;
+    }
+    if (options.kernel == CascadeRuntimeKernel::Avx2Fma) {
+        throw std::invalid_argument(
+            "AVX2/FMA kernel is only available for double-double blocks");
     }
     const bool has_explicit_order = !execution_order.empty();
     long double gain_acc = static_cast<long double>(dec.gain);
@@ -545,11 +989,15 @@ double CascadeFilterState::push_double(double x)
     }
     if (extended_state) {
         const double output = extended_state->push(x);
-        peak_internal = extended_state->peak();
+        if (track_peak) {
+            peak_internal = extended_state->peak();
+        }
         return output;
     }
     long double val = static_cast<long double>(x);
-    peak_internal = std::max(peak_internal, std::abs(val));
+    if (track_peak) {
+        peak_internal = std::max(peak_internal, std::abs(val));
+    }
 
     if (!execution_order.empty()) {
         for (const auto& placement : execution_order) {
@@ -600,7 +1048,9 @@ double CascadeFilterState::push_double(double x)
                 break;
             }
             }
-            peak_internal = std::max(peak_internal, std::abs(val));
+            if (track_peak) {
+                peak_internal = std::max(peak_internal, std::abs(val));
+            }
         }
     } else {
 
@@ -660,7 +1110,9 @@ double CascadeFilterState::push_double(double x)
 
     // ── Коэффициент усиления ─────────────────────────────────
     val *= static_cast<long double>(gain);
-    peak_internal = std::max(peak_internal, std::abs(val));
+    if (track_peak) {
+        peak_internal = std::max(peak_internal, std::abs(val));
+    }
 
     return static_cast<double>(val);
 }

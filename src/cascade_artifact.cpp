@@ -98,6 +98,8 @@ unsigned precision_digits(CascadeRuntimePrecision precision)
     switch (precision) {
     case CascadeRuntimePrecision::Native:
         return 0u;
+    case CascadeRuntimePrecision::DoubleDouble:
+        return 31u;
     case CascadeRuntimePrecision::Extended34:
         return 34u;
     case CascadeRuntimePrecision::Extended50:
@@ -546,6 +548,9 @@ CascadeArtifact decode_payload(const std::string& payload,
     switch (precision) {
     case 0u:
         dec.runtime_precision = CascadeRuntimePrecision::Native;
+        break;
+    case 31u:
+        dec.runtime_precision = CascadeRuntimePrecision::DoubleDouble;
         break;
     case 34u:
         dec.runtime_precision = CascadeRuntimePrecision::Extended34;

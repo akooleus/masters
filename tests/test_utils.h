@@ -116,18 +116,21 @@ inline bool decomposition_is_finite(const CascadeDecomposition& dec)
 inline double cascade_impulse_error_double(
     const DirectFIR& fir,
     const CascadeDecomposition& dec,
-    bool& finite)
+    bool& finite,
+    CascadeRuntimeOptions options = {})
 {
     std::vector<double> impulse(fir.length() * 2u, 0.0);
     impulse[0] = 1.0;
-    const std::vector<double> actual = filter_cascade_double(dec, impulse);
+    CascadeFilterState state;
+    state.init(dec, options);
 
     finite = true;
     double max_error = 0.0;
-    for (size_t i = 0; i < actual.size(); ++i) {
-        finite = finite && std::isfinite(actual[i]);
+    for (size_t i = 0; i < impulse.size(); ++i) {
+        const double actual = state.push_double(impulse[i]);
+        finite = finite && std::isfinite(actual);
         const double expected = (i < fir.h.size()) ? fir.h[i] : 0.0;
-        max_error = std::max(max_error, std::abs(actual[i] - expected));
+        max_error = std::max(max_error, std::abs(actual - expected));
     }
     return finite ? max_error : std::numeric_limits<double>::infinity();
 }
@@ -136,7 +139,8 @@ inline double cascade_signal_error_double(
     const DirectFIR& fir,
     const CascadeDecomposition& dec,
     bool& finite,
-    size_t num_samples = 0)
+    size_t num_samples = 0,
+    CascadeRuntimeOptions options = {})
 {
     if (num_samples == 0) {
         num_samples = fir.length() * 3u;
@@ -149,13 +153,15 @@ inline double cascade_signal_error_double(
     }
 
     const std::vector<double> expected = filter_direct_double(fir, input);
-    const std::vector<double> actual = filter_cascade_double(dec, input);
+    CascadeFilterState state;
+    state.init(dec, options);
     finite = true;
     double max_error = 0.0;
-    for (size_t i = 0; i < actual.size(); ++i) {
+    for (size_t i = 0; i < input.size(); ++i) {
+        const double actual = state.push_double(input[i]);
         finite = finite && std::isfinite(expected[i])
-                        && std::isfinite(actual[i]);
-        max_error = std::max(max_error, std::abs(actual[i] - expected[i]));
+                        && std::isfinite(actual);
+        max_error = std::max(max_error, std::abs(actual - expected[i]));
     }
     return finite ? max_error : std::numeric_limits<double>::infinity();
 }

@@ -142,9 +142,25 @@ enum class CascadeBuildStatus {
 // представления каскада, а не диагностическое поле.
 enum class CascadeRuntimePrecision {
     Native = 0,
+    DoubleDouble = 31,
     Extended34 = 34,
     Extended50 = 50
 };
+
+// Instruction-set kernel is selected at runtime and is deliberately not
+// serialized: the same numerical artifact remains portable between CPUs.
+enum class CascadeRuntimeKernel {
+    Auto,
+    Scalar,
+    Avx2Fma
+};
+
+struct CascadeRuntimeOptions {
+    bool track_peak = false;
+    CascadeRuntimeKernel kernel = CascadeRuntimeKernel::Auto;
+};
+
+bool cascade_runtime_kernel_available(CascadeRuntimeKernel kernel);
 
 // Численные свидетельства, по которым вызывающий код может отличить
 // короткий каскад от безопасного отката к прямой форме.
@@ -317,6 +333,8 @@ struct CascadeFilterState {
     long double                 peak_internal = 0.0L;
     std::unique_ptr<CascadeExtendedState> extended_state;
     bool initialized = false;
+    bool track_peak = false;
+    CascadeRuntimeKernel selected_kernel = CascadeRuntimeKernel::Scalar;
 
     CascadeFilterState() = default;
     CascadeFilterState(const CascadeFilterState&) = delete;
@@ -324,7 +342,8 @@ struct CascadeFilterState {
     CascadeFilterState(CascadeFilterState&&) = default;
     CascadeFilterState& operator=(CascadeFilterState&&) = default;
 
-    void init(const CascadeDecomposition& dec);
+    void init(const CascadeDecomposition& dec,
+              CascadeRuntimeOptions options = {});
     sample_t push(sample_t x);
     double push_double(double x);
     void reset();

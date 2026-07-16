@@ -18,7 +18,7 @@ int main()
     };
 
     // Native precision is preferred through N257T. N513T verifies the
-    // explicitly reported 34-decimal-digit short-block backend.
+    // explicitly reported double-double short-block backend.
     const std::vector<Case> cases = {
         {"N32T",  {32,  48000.0, 8000.0, 12000.0}, true,  4,  1e-11, 1e-10, false},
         {"N33",   {33,  32000.0, 4000.0,  6000.0}, false, 4,  1e-11, 1e-10, false},
@@ -46,11 +46,11 @@ int main()
         ok &= expect(full.diagnostics.status == expected_status,
                      prefix + "expected a verified short-block cascade");
         ok &= expect(full.diagnostics.runtime_decimal_digits
-                         == (tc.high_precision_runtime ? 34u : 0u),
+                         == (tc.high_precision_runtime ? 31u : 0u),
                      prefix + "runtime precision selection mismatch");
         ok &= expect(full.runtime_precision
                          == (tc.high_precision_runtime
-                             ? CascadeRuntimePrecision::Extended34
+                             ? CascadeRuntimePrecision::DoubleDouble
                              : CascadeRuntimePrecision::Native),
                      prefix + "runtime backend selection mismatch");
         ok &= expect(full.diagnostics.complement_verified,
@@ -82,10 +82,17 @@ int main()
         ok &= expect(impulse_error <= tc.maximum_impulse_error,
                      prefix + "impulse max error="
                          + std::to_string(impulse_error));
-        ok &= expect(std::abs(impulse_error
+        bool scalar_impulse_finite = false;
+        const double scalar_impulse_error = cascade_impulse_error_double(
+            fir, full, scalar_impulse_finite,
+            CascadeRuntimeOptions{false, CascadeRuntimeKernel::Scalar});
+        ok &= expect(scalar_impulse_finite
+                         && scalar_impulse_error <= tc.maximum_impulse_error,
+                     prefix + "scalar impulse backend failed");
+        ok &= expect(std::abs(scalar_impulse_error
                               - full.diagnostics.runtime_impulse_error)
                          <= 1e-18,
-                     prefix + "reported impulse error mismatch");
+                     prefix + "reported scalar impulse error mismatch");
 
         bool signal_finite = false;
         const double signal_error = cascade_signal_error_double(
@@ -98,6 +105,16 @@ int main()
                          + std::to_string(signal_error));
 
         if (tc.high_precision_runtime) {
+            CascadeFilterState auto_state;
+            auto_state.init(full);
+            const CascadeRuntimeKernel expected_kernel =
+                cascade_runtime_kernel_available(
+                    CascadeRuntimeKernel::Avx2Fma)
+                ? CascadeRuntimeKernel::Avx2Fma
+                : CascadeRuntimeKernel::Scalar;
+            ok &= expect(auto_state.selected_kernel == expected_kernel,
+                         prefix + "runtime ISA dispatch mismatch");
+
             std::vector<sample_t> short_impulse(32u, 0.0f);
             short_impulse[0] = 1.0f;
             const CompareMetrics float_impulse = compare_signals(
